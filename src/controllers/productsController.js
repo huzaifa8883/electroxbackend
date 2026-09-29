@@ -65,17 +65,41 @@ exports.getProductById = async (req, res) => {
   }
 };
 
+// Normalize images array from body (string JSON or array)
+function normalizeImages(images, image_url) {
+  let imgs = [];
+  if (Array.isArray(images)) {
+    imgs = images.filter(Boolean);
+  } else if (typeof images === "string" && images.trim()) {
+    try {
+      const parsed = JSON.parse(images);
+      if (Array.isArray(parsed)) imgs = parsed.filter(Boolean);
+    } catch {
+      imgs = images.split(",").map((s) => s.trim()).filter(Boolean);
+    }
+  }
+  // Ensure primary image_url is first in gallery if present
+  if (image_url && !imgs.includes(image_url)) {
+    imgs = [image_url, ...imgs];
+  }
+  // Cap at 7
+  return imgs.slice(0, 7);
+}
+
 // POST /api/products
 exports.createProduct = async (req, res) => {
   const {
     sku, name, category, stock = 0, min_stock = 5,
     cost_price = 0, selling_price = 0, supplier_id, box_id,
-    image_url, location,
+    image_url, location, description, characteristics, images,
   } = req.body;
 
   if (!sku || !name) {
     return res.status(400).json({ error: "sku and name are required" });
   }
+
+  const imgs = normalizeImages(images, image_url);
+  const cover = imgs[0] || image_url || null;
 
   const client = await pool.connect();
   try {
@@ -83,19 +107,26 @@ exports.createProduct = async (req, res) => {
 
     const { rows } = await client.query(
       `INSERT INTO products
-        (sku, name, category, stock, min_stock, cost_price, selling_price, supplier_id, box_id, image_url, location)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        (sku, name, category, stock, min_stock, cost_price, selling_price,
+         supplier_id, box_id, image_url, images, description, characteristics, location)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        RETURNING *`,
-      [sku, name, category, stock, min_stock, cost_price, selling_price, supplier_id || null, box_id || null, image_url, location]
+      [
+        sku, name, category || null,
+        Number(stock) || 0, Number(min_stock) || 5,
+        Number(cost_price) || 0, Number(selling_price) || 0,
+        supplier_id || null, box_id || null,
+        cover, imgs, description || null, characteristics || null, location || null,
+      ]
     );
 
     const product = rows[0];
 
-    if (stock > 0) {
+    if (Number(stock) > 0) {
       await client.query(
         `INSERT INTO stock_ledger (product_id, type, quantity_changed, balance_after, reference)
          VALUES ($1, 'adjustment', $2, $2, 'Initial stock')`,
-        [product.id, stock]
+        [product.id, Number(stock)]
       );
     }
 
@@ -114,30 +145,95 @@ exports.createProduct = async (req, res) => {
 // PUT /api/products/:id
 exports.updateProduct = async (req, res) => {
   const { id } = req.params;
-  const fields = ["sku","name","category","min_stock","cost_price","selling_price","supplier_id","box_id","image_url","location"];
-  const updates = [];
-  const values = [];
+  const body = req.body || {};
 
-  fields.forEach((f) => {
-    if (req.body[f] !== undefined) {
-      values.push(req.body[f]);
-      updates.push(`${f} = $${values.length}`);
-    }
-  });
+  // Fields we can set directly (stock handled separately via ledger)
+  const fields = [
+    "sku", "name", "category", "min_stock", "cost_price", "selling_price",
+    "supplier_id", "box_id", "image_url", "location", "description", "characteristics",
+  ];
 
-  if (!updates.length) return res.status(400).json({ error: "No fields to update" });
-
-  values.push(id);
+  const client = await pool.connect();
   try {
-    const { rows } = await pool.query(
+    await client.query("BEGIN");
+
+    // Load current product
+    const { rows: currentRows } = await client.query(
+      `SELECT * FROM products WHERE id = $1 FOR UPDATE`,
+      [id]
+    );
+    if (!currentRows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Product not found" });
+    }
+    const current = currentRows[0];
+
+    const updates = [];
+    const values = [];
+
+    fields.forEach((f) => {
+      if (body[f] !== undefined) {
+        let val = body[f];
+        if (["min_stock", "cost_price", "selling_price"].includes(f)) val = Number(val) || 0;
+        if (["supplier_id", "box_id"].includes(f) && (val === "" || val === null)) val = null;
+        values.push(val);
+        updates.push(`${f} = $${values.length}`);
+      }
+    });
+
+    // Handle images array
+    if (body.images !== undefined || body.image_url !== undefined) {
+      const cover = body.image_url !== undefined ? body.image_url : current.image_url;
+      const imgs = normalizeImages(
+        body.images !== undefined ? body.images : current.images,
+        cover
+      );
+      const finalCover = imgs[0] || cover || null;
+      values.push(finalCover);
+      updates.push(`image_url = $${values.length}`);
+      values.push(imgs);
+      updates.push(`images = $${values.length}`);
+    }
+
+    // Stock change: write ledger entry and update stock
+    if (body.stock !== undefined) {
+      const newStock = Number(body.stock);
+      if (isNaN(newStock) || newStock < 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "stock must be a non-negative number" });
+      }
+      const delta = newStock - Number(current.stock);
+      if (delta !== 0) {
+        values.push(newStock);
+        updates.push(`stock = $${values.length}`);
+        await client.query(
+          `INSERT INTO stock_ledger (product_id, type, quantity_changed, balance_after, reference)
+           VALUES ($1, 'adjustment', $2, $3, $4)`,
+          [id, delta, newStock, "Stock updated via product edit"]
+        );
+      }
+    }
+
+    if (!updates.length) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "No fields to update" });
+    }
+
+    values.push(id);
+    const { rows } = await client.query(
       `UPDATE products SET ${updates.join(", ")} WHERE id = $${values.length} RETURNING *`,
       values
     );
-    if (!rows.length) return res.status(404).json({ error: "Product not found" });
+
+    await client.query("COMMIT");
     res.json(rows[0]);
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error(err);
+    if (err.code === "23505") return res.status(409).json({ error: "SKU already exists" });
     res.status(500).json({ error: "Failed to update product" });
+  } finally {
+    client.release();
   }
 };
 
@@ -163,7 +259,7 @@ exports.adjustStock = async (req, res) => {
   const { id } = req.params;
   const { quantity_changed, type = "adjustment", reference = "" } = req.body;
 
-  if (!quantity_changed || isNaN(quantity_changed)) {
+  if (quantity_changed === undefined || quantity_changed === null || isNaN(Number(quantity_changed))) {
     return res.status(400).json({ error: "quantity_changed (number) is required" });
   }
 
@@ -172,7 +268,7 @@ exports.adjustStock = async (req, res) => {
     await client.query("BEGIN");
     const { rows: prodRows } = await client.query(
       `UPDATE products SET stock = stock + $1 WHERE id = $2 RETURNING *`,
-      [quantity_changed, id]
+      [Number(quantity_changed), id]
     );
     if (!prodRows.length) {
       await client.query("ROLLBACK");
@@ -187,7 +283,7 @@ exports.adjustStock = async (req, res) => {
     await client.query(
       `INSERT INTO stock_ledger (product_id, type, quantity_changed, balance_after, reference)
        VALUES ($1,$2,$3,$4,$5)`,
-      [id, type, quantity_changed, product.stock, reference]
+      [id, type, Number(quantity_changed), product.stock, reference]
     );
 
     await client.query("COMMIT");
@@ -202,12 +298,44 @@ exports.adjustStock = async (req, res) => {
 };
 
 exports.deleteProduct = async (req, res) => {
+  const { id } = req.params;
+  const client = await pool.connect();
   try {
-    const { rowCount } = await pool.query(`DELETE FROM products WHERE id = $1`, [req.params.id]);
-    if (!rowCount) return res.status(404).json({ error: "Product not found" });
+    await client.query("BEGIN");
+
+    // Check if product is used in any sale
+    const { rows: saleCheck } = await client.query(
+      `SELECT COUNT(*)::int AS cnt FROM sale_items WHERE product_id = $1`,
+      [id]
+    );
+    if (saleCheck[0].cnt > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "Cannot delete this product because it has sales history. Remove related sales first, or keep the product for records.",
+      });
+    }
+
+    // purchase_orders references with ON DELETE SET NULL — fine
+    // stock_ledger has ON DELETE CASCADE — fine
+    const { rowCount } = await client.query(`DELETE FROM products WHERE id = $1`, [id]);
+    if (!rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    await client.query("COMMIT");
     res.json({ success: true });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error(err);
+    // FK violation fallback
+    if (err.code === "23503") {
+      return res.status(409).json({
+        error: "Cannot delete this product because it is linked to sales or other records.",
+      });
+    }
     res.status(500).json({ error: "Failed to delete product" });
+  } finally {
+    client.release();
   }
 };
