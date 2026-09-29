@@ -150,7 +150,7 @@ exports.updateProduct = async (req, res) => {
   // Fields we can set directly (stock handled separately via ledger)
   const fields = [
     "sku", "name", "category", "min_stock", "cost_price", "selling_price",
-    "supplier_id", "box_id", "image_url", "location", "description", "characteristics",
+    "supplier_id", "box_id", "location", "description", "characteristics",
   ];
 
   const client = await pool.connect();
