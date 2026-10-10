@@ -1,3 +1,4 @@
+
 const crypto = require("crypto");
 const axios = require("axios");
 const pool = require("../config/db");
@@ -178,6 +179,50 @@ function buildCaption(product) {
 // ─────────────────────────────────────────────────────────────
 // 1. Sync Product to Inventory DB (upsert by SKU) — ALL images
 // ─────────────────────────────────────────────────────────────
+function getMetaValue(wooProduct, keys) {
+  const list = Array.isArray(wooProduct.meta_data) ? wooProduct.meta_data : [];
+  const want = keys.map((k) => String(k).toLowerCase());
+  for (const m of list) {
+    const key = String(m.key || m.meta_key || "").toLowerCase();
+    if (want.includes(key)) {
+      const v = m.value !== undefined ? m.value : m.meta_value;
+      if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve box_id from meta _inventory_box (box_number).
+ * Creates the box in inventory if it does not exist yet.
+ */
+async function resolveBoxId(boxNumber) {
+  if (!boxNumber) return null;
+  const num = String(boxNumber).trim();
+  if (!num) return null;
+
+  const existing = await pool.query(
+    `SELECT id FROM boxes WHERE box_number = $1 LIMIT 1`,
+    [num]
+  );
+  if (existing.rows.length) return existing.rows[0].id;
+
+  try {
+    const created = await pool.query(
+      `INSERT INTO boxes (box_number, description)
+       VALUES ($1, $2)
+       ON CONFLICT (box_number) DO UPDATE SET box_number = EXCLUDED.box_number
+       RETURNING id`,
+      [num, "Created from website product"]
+    );
+    console.log(`[WooCommerce Webhook] 📦 Box created → ${num} id=${created.rows[0].id}`);
+    return created.rows[0].id;
+  } catch (err) {
+    console.error("[WooCommerce Webhook] Box resolve failed:", err.message);
+    return null;
+  }
+}
+
 async function syncToDatabase(wooProduct) {
   try {
     const sku =
@@ -198,6 +243,22 @@ async function syncToDatabase(wooProduct) {
       wooProduct.description || wooProduct.short_description || ""
     );
 
+    // Cost price from product meta (admin only field on website)
+    const costRaw = getMetaValue(wooProduct, ["_cost_price", "cost_price"]);
+    const costPrice =
+      costRaw !== null && costRaw !== undefined && String(costRaw).trim() !== ""
+        ? Number(costRaw) || 0
+        : null;
+
+    // Box from product meta (box_number string)
+    const boxNumber = getMetaValue(wooProduct, [
+      "_inventory_box",
+      "inventory_box",
+      "_box",
+      "box",
+    ]);
+    const boxId = await resolveBoxId(boxNumber);
+
     // ALL images from WooCommerce product
     let images = [];
     if (Array.isArray(wooProduct.images) && wooProduct.images.length > 0) {
@@ -207,17 +268,20 @@ async function syncToDatabase(wooProduct) {
     }
     const imageUrl = images[0] || null;
 
+    // Only set cost_price / box_id when provided so updates don't wipe existing inventory values
     const { rows } = await pool.query(
       `INSERT INTO products (
-         sku, name, category, stock, selling_price,
+         sku, name, category, stock, selling_price, cost_price, box_id,
          image_url, images, description, min_stock
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 5)
+       VALUES ($1, $2, $3, $4, $5, COALESCE($6, 0), $7, $8, $9, $10, 5)
        ON CONFLICT (sku) DO UPDATE SET
          name          = EXCLUDED.name,
          category      = EXCLUDED.category,
          stock         = EXCLUDED.stock,
          selling_price = EXCLUDED.selling_price,
+         cost_price    = COALESCE($6, products.cost_price),
+         box_id        = COALESCE($7, products.box_id),
          image_url     = COALESCE(EXCLUDED.image_url, products.image_url),
          images        = CASE
                            WHEN EXCLUDED.images IS NOT NULL AND array_length(EXCLUDED.images, 1) > 0
@@ -225,12 +289,23 @@ async function syncToDatabase(wooProduct) {
                            ELSE products.images
                          END,
          description   = EXCLUDED.description
-       RETURNING id, sku, name, category`,
-      [sku, name, category, stock, sellingPrice, imageUrl, images, description]
+       RETURNING id, sku, name, category, cost_price, box_id`,
+      [
+        sku,
+        name,
+        category,
+        stock,
+        sellingPrice,
+        costPrice,
+        boxId,
+        imageUrl,
+        images,
+        description,
+      ]
     );
 
     console.log(
-      `[WooCommerce Webhook] ✅ Product synced → id=${rows[0].id} sku=${rows[0].sku} category="${rows[0].category}" images=${images.length}`
+      `[WooCommerce Webhook] ✅ Product synced → id=${rows[0].id} sku=${rows[0].sku} category="${rows[0].category}" cost=${rows[0].cost_price} box_id=${rows[0].box_id} images=${images.length}`
     );
     return rows[0];
   } catch (err) {
@@ -382,4 +457,4 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
   processWebhookPayload(body).catch((err) => {
     console.error("[WooCommerce Webhook] Unhandled background error:", err);
   });
-};
+}
