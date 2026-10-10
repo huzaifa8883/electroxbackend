@@ -177,24 +177,8 @@ function buildCaption(product) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 1. Sync Product to Inventory DB (upsert by woo_product_id + SKU)
+// 1. Sync Product to Inventory DB (SKU / WC-{id} only — no ALTER)
 // ─────────────────────────────────────────────────────────────
-let wooIdColumnReady = false;
-async function ensureWooProductIdColumn() {
-  if (wooIdColumnReady) return;
-  try {
-    await pool.query(
-      `ALTER TABLE products ADD COLUMN IF NOT EXISTS woo_product_id INTEGER`
-    );
-    await pool.query(
-      `CREATE UNIQUE INDEX IF NOT EXISTS idx_products_woo_product_id
-       ON products (woo_product_id) WHERE woo_product_id IS NOT NULL`
-    );
-    wooIdColumnReady = true;
-  } catch (err) {
-    console.warn("[WooCommerce Webhook] woo_product_id column ensure:", err.message);
-  }
-}
 
 /** Return meta value if key exists (including empty / 0). missing → undefined */
 function getMetaEntry(wooProduct, keys) {
@@ -211,8 +195,7 @@ function getMetaEntry(wooProduct, keys) {
 
 /**
  * Resolve box_id from box_number string.
- * Creates the box in inventory if it does not exist yet.
- * Returns null if boxNumber empty.
+ * Creates the box if missing.
  */
 async function resolveBoxId(boxNumber) {
   if (boxNumber === undefined || boxNumber === null) return null;
@@ -241,14 +224,35 @@ async function resolveBoxId(boxNumber) {
   }
 }
 
+/**
+ * Find inventory product id for a Woo product.
+ * Tries: exact SKU → WC-{wooId} → any sku ending / matching patterns.
+ */
+async function findExistingProductId(sku, wooId) {
+  if (sku) {
+    const bySku = await pool.query(
+      `SELECT id FROM products WHERE sku = $1 LIMIT 1`,
+      [sku]
+    );
+    if (bySku.rows.length) return bySku.rows[0].id;
+  }
+  if (wooId) {
+    const fallbackSku = `WC-${wooId}`;
+    const byWc = await pool.query(
+      `SELECT id FROM products WHERE sku = $1 LIMIT 1`,
+      [fallbackSku]
+    );
+    if (byWc.rows.length) return byWc.rows[0].id;
+  }
+  return null;
+}
+
 async function syncToDatabase(wooProduct) {
   try {
-    await ensureWooProductIdColumn();
-
     const wooId = wooProduct.id ? Number(wooProduct.id) : null;
-    const sku =
-      (wooProduct.sku && String(wooProduct.sku).trim()) ||
-      (wooId ? `WC-${wooId}` : null);
+    // Prefer real SKU; if empty use WC-{id} so create/update stay consistent
+    const rawSku = wooProduct.sku && String(wooProduct.sku).trim();
+    const sku = rawSku || (wooId ? `WC-${wooId}` : null);
 
     if (!sku) {
       console.warn("[WooCommerce Webhook] No SKU / id – skip sync");
@@ -258,7 +262,6 @@ async function syncToDatabase(wooProduct) {
     const name = (wooProduct.name || "Untitled Product").trim();
     const category = mapWooCategories(wooProduct.categories || []);
 
-    // Stock: only apply when Woo sends a real quantity (manage stock on)
     const manageStock =
       wooProduct.manage_stock === true ||
       wooProduct.manage_stock === "true" ||
@@ -268,7 +271,9 @@ async function syncToDatabase(wooProduct) {
       wooProduct.stock_quantity !== null &&
       wooProduct.stock_quantity !== undefined &&
       wooProduct.stock_quantity !== "";
-    const stock = hasStockQty ? Number(wooProduct.stock_quantity) || 0 : null;
+    // Update stock when manage_stock is on OR quantity is explicitly sent
+    const stock =
+      hasStockQty ? Number(wooProduct.stock_quantity) || 0 : null;
 
     const sellingPrice =
       Number(wooProduct.sale_price) ||
@@ -280,14 +285,10 @@ async function syncToDatabase(wooProduct) {
       wooProduct.description || wooProduct.short_description || ""
     );
 
-    // Cost price — update when meta key is present (including 0)
     const costRaw = getMetaEntry(wooProduct, ["_cost_price", "cost_price"]);
     const hasCostMeta = costRaw !== undefined;
-    const costPrice = hasCostMeta
-      ? Number(costRaw) || 0
-      : null;
+    const costPrice = hasCostMeta ? Number(costRaw) || 0 : null;
 
-    // Box — update when meta key is present
     const boxRaw = getMetaEntry(wooProduct, [
       "_inventory_box",
       "inventory_box",
@@ -297,10 +298,9 @@ async function syncToDatabase(wooProduct) {
     const hasBoxMeta = boxRaw !== undefined;
     let boxId = null;
     if (hasBoxMeta) {
-      boxId = await resolveBoxId(boxRaw); // null if cleared
+      boxId = await resolveBoxId(boxRaw);
     }
 
-    // Images
     let images = [];
     if (Array.isArray(wooProduct.images) && wooProduct.images.length > 0) {
       images = wooProduct.images
@@ -309,33 +309,15 @@ async function syncToDatabase(wooProduct) {
     }
     const imageUrl = images[0] || null;
 
-    // Find existing row: prefer woo_product_id, then SKU, then WC-{id} fallback
-    let existingId = null;
-    if (wooId) {
-      const byWoo = await pool.query(
-        `SELECT id, sku FROM products WHERE woo_product_id = $1 LIMIT 1`,
-        [wooId]
-      );
-      if (byWoo.rows.length) existingId = byWoo.rows[0].id;
-    }
-    if (!existingId) {
-      const bySku = await pool.query(
-        `SELECT id FROM products WHERE sku = $1 LIMIT 1`,
-        [sku]
-      );
-      if (bySku.rows.length) existingId = bySku.rows[0].id;
-    }
-    if (!existingId && wooId) {
-      const byFallback = await pool.query(
-        `SELECT id FROM products WHERE sku = $1 LIMIT 1`,
-        [`WC-${wooId}`]
-      );
-      if (byFallback.rows.length) existingId = byFallback.rows[0].id;
+    // Find existing: real SKU first, then WC-{id}
+    let existingId = await findExistingProductId(rawSku || null, wooId);
+    // If website now has a real SKU but inventory still has WC-{id}, link them
+    if (!existingId && rawSku && wooId) {
+      existingId = await findExistingProductId(null, wooId);
     }
 
     let rows;
     if (existingId) {
-      // ─── UPDATE existing product (website edit) ───
       const sets = [
         `name = $1`,
         `category = $2`,
@@ -345,10 +327,6 @@ async function syncToDatabase(wooProduct) {
       ];
       const vals = [name, category, sellingPrice, description, sku];
 
-      if (wooId) {
-        vals.push(wooId);
-        sets.push(`woo_product_id = $${vals.length}`);
-      }
       if (stock !== null) {
         vals.push(stock);
         sets.push(`stock = $${vals.length}`);
@@ -381,13 +359,12 @@ async function syncToDatabase(wooProduct) {
         `[WooCommerce Webhook] 🔄 UPDATED id=${rows[0].id} sku=${rows[0].sku} stock=${rows[0].stock} price=${rows[0].selling_price} cost=${rows[0].cost_price} box_id=${rows[0].box_id}`
       );
     } else {
-      // ─── INSERT new product ───
       const { rows: inserted } = await pool.query(
         `INSERT INTO products (
            sku, name, category, stock, selling_price, cost_price, box_id,
-           image_url, images, description, min_stock, woo_product_id
+           image_url, images, description, min_stock
          )
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,5,$11)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,5)
          ON CONFLICT (sku) DO UPDATE SET
            name          = EXCLUDED.name,
            category      = EXCLUDED.category,
@@ -401,8 +378,7 @@ async function syncToDatabase(wooProduct) {
                              THEN EXCLUDED.images
                              ELSE products.images
                            END,
-           description   = EXCLUDED.description,
-           woo_product_id = COALESCE(EXCLUDED.woo_product_id, products.woo_product_id)
+           description   = EXCLUDED.description
          RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
         [
           sku,
@@ -415,12 +391,11 @@ async function syncToDatabase(wooProduct) {
           imageUrl,
           images,
           description,
-          wooId,
         ]
       );
       rows = inserted;
       console.log(
-        `[WooCommerce Webhook] ✅ CREATED id=${rows[0].id} sku=${rows[0].sku} stock=${rows[0].stock} price=${rows[0].selling_price} cost=${rows[0].cost_price} box_id=${rows[0].box_id}`
+        `[WooCommerce Webhook] ✅ CREATED/UPSERT id=${rows[0].id} sku=${rows[0].sku} stock=${rows[0].stock} price=${rows[0].selling_price} cost=${rows[0].cost_price} box_id=${rows[0].box_id}`
       );
     }
 
@@ -562,9 +537,20 @@ async function processWebhookPayload(wooProduct, topic) {
 // Main Express handler
 // ─────────────────────────────────────────────────────────────
 exports.handleWooCommerceProductWebhook = async (req, res) => {
-  // Immediate 200 so WooCommerce never times out
-  res.status(200).send({ success: true, message: "Webhook received" });
+  const body = req.body || {};
+  const topic = String(
+    req.headers["x-wc-webhook-topic"] ||
+      req.headers["x-wc-webhook-event"] ||
+      body.topic ||
+      ""
+  ).toLowerCase();
 
+  console.log(
+    `[WooCommerce Webhook] INCOMING topic=${topic || "unknown"} id=${body?.id} sku=${body?.sku} name=${body?.name} keys=${Object.keys(body).join(",")}`
+  );
+
+  // Respond AFTER we start work, but still quick — actually process sync AWAIT so we know it worked
+  // (Woo allows ~5s; our DB update is fast)
   try {
     if (!verifyWooSignature(req)) {
       console.warn("[WooCommerce Webhook] Invalid signature – continuing anyway");
@@ -573,29 +559,48 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
     console.warn("[WooCommerce Webhook] Signature check error:", sigErr.message);
   }
 
-  const body = req.body;
-  const topic = String(
-    req.headers["x-wc-webhook-topic"] ||
-      req.headers["x-wc-webhook-event"] ||
-      ""
-  ).toLowerCase();
-
-  console.log(
-    `[WooCommerce Webhook] topic=${topic || "unknown"} id=${body?.id} sku=${body?.sku} name=${body?.name}`
-  );
-
-  // Ignore deletes
   if (topic === "product.deleted") {
     console.log("[WooCommerce Webhook] product.deleted – inventory unchanged");
-    return;
+    return res.status(200).json({ success: true, message: "deleted ignored" });
   }
 
   if (!body || (!body.id && !body.sku && !body.name)) {
     console.log("[WooCommerce Webhook] Empty or test payload – ignored");
-    return;
+    return res.status(200).json({ success: true, message: "empty ignored" });
   }
 
-  processWebhookPayload(body, topic).catch((err) => {
-    console.error("[WooCommerce Webhook] Unhandled background error:", err);
-  });
+  try {
+    // Await DB sync so create+update both definitely run before response
+    const row = await syncToDatabase(body);
+    // Social only on create (non-blocking)
+    const isCreate =
+      !topic ||
+      topic === "product.created" ||
+      topic === "product.restored";
+    if (isCreate) {
+      Promise.allSettled([postToFacebook(body), postToInstagram(body)]).catch(() => {});
+    }
+    return res.status(200).json({
+      success: true,
+      message: "synced",
+      product: row
+        ? {
+            id: row.id,
+            sku: row.sku,
+            stock: row.stock,
+            selling_price: row.selling_price,
+            cost_price: row.cost_price,
+            box_id: row.box_id,
+          }
+        : null,
+    });
+  } catch (err) {
+    console.error("[WooCommerce Webhook] Sync error:", err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+};
+
+// Health ping for WordPress to verify URL
+exports.webhookPing = async (req, res) => {
+  res.status(200).json({ ok: true, service: "electrox-inventory", time: new Date().toISOString() });
 };
