@@ -18,8 +18,8 @@ app.use(morgan("dev"));
 // Serve uploaded product images
 app.use("/uploads", express.static(path.join(__dirname, "..", "uploads")));
 
-// ========== PUBLIC ROUTES (NO AUTH) — SAB SE PEHLE ==========
-app.use("/webhooks", webhooksRoutes);   // ← /api se bahar
+// ========== PUBLIC ROUTES (NO AUTH) — FIRST ==========
+app.use("/webhooks", webhooksRoutes);
 app.get("/api/health", (req, res) => res.json({ status: "ok" }));
 
 // ========== AUTH + PROTECTED ROUTES ==========
