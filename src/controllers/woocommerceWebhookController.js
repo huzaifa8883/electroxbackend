@@ -3,11 +3,11 @@ const axios = require("axios");
 const pool = require("../config/db");
 
 // ─────────────────────────────────────────────────────────────
-// Signature verification (optional but recommended)
+// Signature verification (optional)
 // ─────────────────────────────────────────────────────────────
 function verifyWooSignature(req) {
   const secret = process.env.WOOCOMMERCE_WEBHOOK_SECRET;
-  if (!secret) return true; // secret not set → skip check
+  if (!secret) return true;
 
   const signature = req.headers["x-wc-webhook-signature"];
   if (!signature) return false;
@@ -43,37 +43,23 @@ function stripHtml(html = "") {
 
 /**
  * Dynamic Category Mapping
- * -----------------------------------------
- * Rule:
- *   Website pe jo category assigned hai, inventory mein bilkul usi matching
- *   category mein product jaaye.
- *
- * Special restructuring rules (as required):
- *   1. Cables → subcategories: AC Cables, DC Cables, Power Cables,
- *      Mobile Cables, Display Cables, Connectors, Others
- *   2. Battery Chargers (and other chargers) → standalone main category "Chargers"
- *      with subs: Battery Chargers, Laptop Chargers, Mobile Chargers, Wireless Chargers
- *   3. Computer and Networking → new main category
- *
- * Everything else (Power Supplies, CCTV, Electric, etc.) → exact name match.
- * Format stored in DB: "MainCategory" or "MainCategory > SubCategory"
+ * Website category → Inventory category (exact match for most)
+ * Special rules for Cables subs, Chargers, Computer and Networking
  */
 function mapWooCategories(wooCategories = []) {
   if (!Array.isArray(wooCategories) || wooCategories.length === 0) {
     return "Uncategorized";
   }
 
-  // Normalize for matching
   const normalized = wooCategories.map((c) => ({
     original: (c.name || c.slug || "").trim(),
     lower: (c.name || c.slug || "").trim().toLowerCase(),
     parent: c.parent || 0,
   }));
 
-  // Prefer the deepest (child) category first
   const sorted = [...normalized].sort((a, b) => b.parent - a.parent);
 
-  // ─── 1. Cables special handling ────────────────────────────
+  // ─── Cables subcategories ───────────────────────────────────
   const cableSubMap = {
     "ac cables": "AC Cables",
     "ac cable": "AC Cables",
@@ -99,12 +85,11 @@ function mapWooCategories(wooCategories = []) {
     }
   }
 
-  // Generic "cables" without specific sub
   if (sorted.some((i) => i.lower.includes("cable"))) {
     return "Cables > Others";
   }
 
-  // ─── 2. Chargers (standalone main category) ────────────────
+  // ─── Chargers (standalone main category) ────────────────────
   const chargerSubMap = {
     "battery chargers": "Battery Chargers",
     "battery charger": "Battery Chargers",
@@ -124,12 +109,11 @@ function mapWooCategories(wooCategories = []) {
     }
   }
 
-  // Generic charger / charging related
   if (sorted.some((i) => i.lower.includes("charger") || i.lower.includes("charging"))) {
     return "Chargers > Battery Chargers";
   }
 
-  // ─── 3. Computer and Networking ────────────────────────────
+  // ─── Computer and Networking ────────────────────────────────
   if (
     sorted.some(
       (i) =>
@@ -144,7 +128,6 @@ function mapWooCategories(wooCategories = []) {
         i.lower.includes("nic")
     )
   ) {
-    // Keep a more specific subcategory name if present
     const specific = sorted.find((i) => {
       const n = i.lower;
       return (
@@ -162,10 +145,8 @@ function mapWooCategories(wooCategories = []) {
     return "Computer and Networking";
   }
 
-  // ─── 4. Everything else → exact match from website ─────────
-  // Use the deepest category name as-is (Power Supplies, CCTV, Electric, etc.)
-  const primary = sorted[0]?.original || "Uncategorized";
-  return primary;
+  // ─── Everything else → exact name from website ──────────────
+  return sorted[0]?.original || "Uncategorized";
 }
 
 function buildCaption(product) {
@@ -195,7 +176,7 @@ function buildCaption(product) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 1. Sync Product to Inventory DB (upsert by SKU)
+// 1. Sync Product to Inventory DB (upsert by SKU) — ALL images
 // ─────────────────────────────────────────────────────────────
 async function syncToDatabase(wooProduct) {
   try {
@@ -217,12 +198,14 @@ async function syncToDatabase(wooProduct) {
       wooProduct.description || wooProduct.short_description || ""
     );
 
-    let imageUrl = null;
+    // ALL images from WooCommerce product
+    let images = [];
     if (Array.isArray(wooProduct.images) && wooProduct.images.length > 0) {
-      imageUrl = wooProduct.images[0].src || wooProduct.images[0].url || null;
+      images = wooProduct.images
+        .map((img) => img.src || img.url)
+        .filter(Boolean);
     }
-
-    const images = imageUrl ? [imageUrl] : [];
+    const imageUrl = images[0] || null;
 
     const { rows } = await pool.query(
       `INSERT INTO products (
@@ -247,7 +230,7 @@ async function syncToDatabase(wooProduct) {
     );
 
     console.log(
-      `[WooCommerce Webhook] ✅ Product synced → id=${rows[0].id} sku=${rows[0].sku} category="${rows[0].category}"`
+      `[WooCommerce Webhook] ✅ Product synced → id=${rows[0].id} sku=${rows[0].sku} category="${rows[0].category}" images=${images.length}`
     );
     return rows[0];
   } catch (err) {
@@ -319,7 +302,6 @@ async function postToInstagram(wooProduct) {
   const caption = buildCaption(wooProduct);
 
   try {
-    // Step A – Create media container
     const createUrl = `https://graph.facebook.com/v19.0/${igAccountId}/media`;
     const { data: container } = await axios.post(
       createUrl,
@@ -335,7 +317,6 @@ async function postToInstagram(wooProduct) {
       throw new Error("No container ID returned from Instagram media endpoint");
     }
 
-    // Step B – Publish
     const publishUrl = `https://graph.facebook.com/v19.0/${igAccountId}/media_publish`;
     const { data: published } = await axios.post(
       publishUrl,
@@ -384,8 +365,8 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
 
   try {
     if (!verifyWooSignature(req)) {
-      console.warn("[WooCommerce Webhook] Invalid signature – payload discarded");
-      // return;
+      console.warn("[WooCommerce Webhook] Invalid signature – continuing anyway");
+      // do NOT return — still process the product
     }
   } catch (sigErr) {
     console.warn("[WooCommerce Webhook] Signature check error:", sigErr.message);
