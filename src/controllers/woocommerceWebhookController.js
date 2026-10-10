@@ -1,4 +1,3 @@
-
 const crypto = require("crypto");
 const axios = require("axios");
 const pool = require("../config/db");
@@ -177,27 +176,45 @@ function buildCaption(product) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 1. Sync Product to Inventory DB (upsert by SKU) — ALL images
+// 1. Sync Product to Inventory DB (upsert by woo_product_id + SKU)
 // ─────────────────────────────────────────────────────────────
-function getMetaValue(wooProduct, keys) {
+let wooIdColumnReady = false;
+async function ensureWooProductIdColumn() {
+  if (wooIdColumnReady) return;
+  try {
+    await pool.query(
+      `ALTER TABLE products ADD COLUMN IF NOT EXISTS woo_product_id INTEGER`
+    );
+    await pool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_products_woo_product_id
+       ON products (woo_product_id) WHERE woo_product_id IS NOT NULL`
+    );
+    wooIdColumnReady = true;
+  } catch (err) {
+    console.warn("[WooCommerce Webhook] woo_product_id column ensure:", err.message);
+  }
+}
+
+/** Return meta value if key exists (including empty / 0). missing → undefined */
+function getMetaEntry(wooProduct, keys) {
   const list = Array.isArray(wooProduct.meta_data) ? wooProduct.meta_data : [];
   const want = keys.map((k) => String(k).toLowerCase());
   for (const m of list) {
     const key = String(m.key || m.meta_key || "").toLowerCase();
     if (want.includes(key)) {
-      const v = m.value !== undefined ? m.value : m.meta_value;
-      if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+      return m.value !== undefined ? m.value : m.meta_value;
     }
   }
-  return null;
+  return undefined;
 }
 
 /**
- * Resolve box_id from meta _inventory_box (box_number).
+ * Resolve box_id from box_number string.
  * Creates the box in inventory if it does not exist yet.
+ * Returns null if boxNumber empty.
  */
 async function resolveBoxId(boxNumber) {
-  if (!boxNumber) return null;
+  if (boxNumber === undefined || boxNumber === null) return null;
   const num = String(boxNumber).trim();
   if (!num) return null;
 
@@ -225,13 +242,32 @@ async function resolveBoxId(boxNumber) {
 
 async function syncToDatabase(wooProduct) {
   try {
+    await ensureWooProductIdColumn();
+
+    const wooId = wooProduct.id ? Number(wooProduct.id) : null;
     const sku =
       (wooProduct.sku && String(wooProduct.sku).trim()) ||
-      `WC-${wooProduct.id}`;
+      (wooId ? `WC-${wooId}` : null);
+
+    if (!sku) {
+      console.warn("[WooCommerce Webhook] No SKU / id – skip sync");
+      return null;
+    }
 
     const name = (wooProduct.name || "Untitled Product").trim();
     const category = mapWooCategories(wooProduct.categories || []);
-    const stock = Number(wooProduct.stock_quantity) || 0;
+
+    // Stock: only apply when Woo sends a real quantity (manage stock on)
+    const manageStock =
+      wooProduct.manage_stock === true ||
+      wooProduct.manage_stock === "true" ||
+      wooProduct.manage_stock === 1 ||
+      wooProduct.manage_stock === "yes";
+    const hasStockQty =
+      wooProduct.stock_quantity !== null &&
+      wooProduct.stock_quantity !== undefined &&
+      wooProduct.stock_quantity !== "";
+    const stock = hasStockQty ? Number(wooProduct.stock_quantity) || 0 : null;
 
     const sellingPrice =
       Number(wooProduct.sale_price) ||
@@ -243,23 +279,27 @@ async function syncToDatabase(wooProduct) {
       wooProduct.description || wooProduct.short_description || ""
     );
 
-    // Cost price from product meta (admin only field on website)
-    const costRaw = getMetaValue(wooProduct, ["_cost_price", "cost_price"]);
-    const costPrice =
-      costRaw !== null && costRaw !== undefined && String(costRaw).trim() !== ""
-        ? Number(costRaw) || 0
-        : null;
+    // Cost price — update when meta key is present (including 0)
+    const costRaw = getMetaEntry(wooProduct, ["_cost_price", "cost_price"]);
+    const hasCostMeta = costRaw !== undefined;
+    const costPrice = hasCostMeta
+      ? Number(costRaw) || 0
+      : null;
 
-    // Box from product meta (box_number string)
-    const boxNumber = getMetaValue(wooProduct, [
+    // Box — update when meta key is present
+    const boxRaw = getMetaEntry(wooProduct, [
       "_inventory_box",
       "inventory_box",
       "_box",
       "box",
     ]);
-    const boxId = await resolveBoxId(boxNumber);
+    const hasBoxMeta = boxRaw !== undefined;
+    let boxId = null;
+    if (hasBoxMeta) {
+      boxId = await resolveBoxId(boxRaw); // null if cleared
+    }
 
-    // ALL images from WooCommerce product
+    // Images
     let images = [];
     if (Array.isArray(wooProduct.images) && wooProduct.images.length > 0) {
       images = wooProduct.images
@@ -268,45 +308,121 @@ async function syncToDatabase(wooProduct) {
     }
     const imageUrl = images[0] || null;
 
-    // Only set cost_price / box_id when provided so updates don't wipe existing inventory values
-    const { rows } = await pool.query(
-      `INSERT INTO products (
-         sku, name, category, stock, selling_price, cost_price, box_id,
-         image_url, images, description, min_stock
-       )
-       VALUES ($1, $2, $3, $4, $5, COALESCE($6, 0), $7, $8, $9, $10, 5)
-       ON CONFLICT (sku) DO UPDATE SET
-         name          = EXCLUDED.name,
-         category      = EXCLUDED.category,
-         stock         = EXCLUDED.stock,
-         selling_price = EXCLUDED.selling_price,
-         cost_price    = COALESCE($6, products.cost_price),
-         box_id        = COALESCE($7, products.box_id),
-         image_url     = COALESCE(EXCLUDED.image_url, products.image_url),
-         images        = CASE
-                           WHEN EXCLUDED.images IS NOT NULL AND array_length(EXCLUDED.images, 1) > 0
-                           THEN EXCLUDED.images
-                           ELSE products.images
-                         END,
-         description   = EXCLUDED.description
-       RETURNING id, sku, name, category, cost_price, box_id`,
-      [
-        sku,
-        name,
-        category,
-        stock,
-        sellingPrice,
-        costPrice,
-        boxId,
-        imageUrl,
-        images,
-        description,
-      ]
-    );
+    // Find existing row: prefer woo_product_id, then SKU, then WC-{id} fallback
+    let existingId = null;
+    if (wooId) {
+      const byWoo = await pool.query(
+        `SELECT id, sku FROM products WHERE woo_product_id = $1 LIMIT 1`,
+        [wooId]
+      );
+      if (byWoo.rows.length) existingId = byWoo.rows[0].id;
+    }
+    if (!existingId) {
+      const bySku = await pool.query(
+        `SELECT id FROM products WHERE sku = $1 LIMIT 1`,
+        [sku]
+      );
+      if (bySku.rows.length) existingId = bySku.rows[0].id;
+    }
+    if (!existingId && wooId) {
+      const byFallback = await pool.query(
+        `SELECT id FROM products WHERE sku = $1 LIMIT 1`,
+        [`WC-${wooId}`]
+      );
+      if (byFallback.rows.length) existingId = byFallback.rows[0].id;
+    }
 
-    console.log(
-      `[WooCommerce Webhook] ✅ Product synced → id=${rows[0].id} sku=${rows[0].sku} category="${rows[0].category}" cost=${rows[0].cost_price} box_id=${rows[0].box_id} images=${images.length}`
-    );
+    let rows;
+    if (existingId) {
+      // ─── UPDATE existing product (website edit) ───
+      const sets = [
+        `name = $1`,
+        `category = $2`,
+        `selling_price = $3`,
+        `description = $4`,
+        `sku = $5`,
+      ];
+      const vals = [name, category, sellingPrice, description, sku];
+
+      if (wooId) {
+        vals.push(wooId);
+        sets.push(`woo_product_id = $${vals.length}`);
+      }
+      if (stock !== null) {
+        vals.push(stock);
+        sets.push(`stock = $${vals.length}`);
+      }
+      if (hasCostMeta) {
+        vals.push(costPrice);
+        sets.push(`cost_price = $${vals.length}`);
+      }
+      if (hasBoxMeta) {
+        vals.push(boxId);
+        sets.push(`box_id = $${vals.length}`);
+      }
+      if (imageUrl) {
+        vals.push(imageUrl);
+        sets.push(`image_url = COALESCE($${vals.length}, image_url)`);
+      }
+      if (images.length > 0) {
+        vals.push(images);
+        sets.push(`images = $${vals.length}`);
+      }
+
+      vals.push(existingId);
+      const { rows: updated } = await pool.query(
+        `UPDATE products SET ${sets.join(", ")} WHERE id = $${vals.length}
+         RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
+        vals
+      );
+      rows = updated;
+      console.log(
+        `[WooCommerce Webhook] 🔄 UPDATED id=${rows[0].id} sku=${rows[0].sku} stock=${rows[0].stock} price=${rows[0].selling_price} cost=${rows[0].cost_price} box_id=${rows[0].box_id}`
+      );
+    } else {
+      // ─── INSERT new product ───
+      const { rows: inserted } = await pool.query(
+        `INSERT INTO products (
+           sku, name, category, stock, selling_price, cost_price, box_id,
+           image_url, images, description, min_stock, woo_product_id
+         )
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,5,$11)
+         ON CONFLICT (sku) DO UPDATE SET
+           name          = EXCLUDED.name,
+           category      = EXCLUDED.category,
+           stock         = COALESCE(EXCLUDED.stock, products.stock),
+           selling_price = EXCLUDED.selling_price,
+           cost_price    = COALESCE(EXCLUDED.cost_price, products.cost_price),
+           box_id        = COALESCE(EXCLUDED.box_id, products.box_id),
+           image_url     = COALESCE(EXCLUDED.image_url, products.image_url),
+           images        = CASE
+                             WHEN EXCLUDED.images IS NOT NULL AND array_length(EXCLUDED.images, 1) > 0
+                             THEN EXCLUDED.images
+                             ELSE products.images
+                           END,
+           description   = EXCLUDED.description,
+           woo_product_id = COALESCE(EXCLUDED.woo_product_id, products.woo_product_id)
+         RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
+        [
+          sku,
+          name,
+          category,
+          stock !== null ? stock : 0,
+          sellingPrice,
+          hasCostMeta ? costPrice : 0,
+          hasBoxMeta ? boxId : null,
+          imageUrl,
+          images,
+          description,
+          wooId,
+        ]
+      );
+      rows = inserted;
+      console.log(
+        `[WooCommerce Webhook] ✅ CREATED id=${rows[0].id} sku=${rows[0].sku} stock=${rows[0].stock} price=${rows[0].selling_price} cost=${rows[0].cost_price} box_id=${rows[0].box_id}`
+      );
+    }
+
     return rows[0];
   } catch (err) {
     console.error("[WooCommerce Webhook] ❌ Database sync failed:", err.message);
@@ -416,15 +532,25 @@ async function postToInstagram(wooProduct) {
 // ─────────────────────────────────────────────────────────────
 // Background processor
 // ─────────────────────────────────────────────────────────────
-async function processWebhookPayload(wooProduct) {
-  const results = await Promise.allSettled([
-    syncToDatabase(wooProduct),
-    postToFacebook(wooProduct),
-    postToInstagram(wooProduct),
-  ]);
+async function processWebhookPayload(wooProduct, topic) {
+  // Always sync inventory on create + update
+  const jobs = [syncToDatabase(wooProduct)];
 
+  // Social posts only for brand-new products (avoid spam on every edit)
+  const isCreate =
+    !topic ||
+    topic === "product.created" ||
+    topic === "product.restored";
+  if (isCreate) {
+    jobs.push(postToFacebook(wooProduct));
+    jobs.push(postToInstagram(wooProduct));
+  }
+
+  const results = await Promise.allSettled(jobs);
   results.forEach((r, i) => {
-    const labels = ["DB Sync", "Facebook", "Instagram"];
+    const labels = isCreate
+      ? ["DB Sync", "Facebook", "Instagram"]
+      : ["DB Sync"];
     if (r.status === "rejected") {
       console.error(`[WooCommerce Webhook] ${labels[i]} rejected:`, r.reason?.message || r.reason);
     }
@@ -441,20 +567,34 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
   try {
     if (!verifyWooSignature(req)) {
       console.warn("[WooCommerce Webhook] Invalid signature – continuing anyway");
-      // do NOT return — still process the product
     }
   } catch (sigErr) {
     console.warn("[WooCommerce Webhook] Signature check error:", sigErr.message);
   }
 
   const body = req.body;
+  const topic = String(
+    req.headers["x-wc-webhook-topic"] ||
+      req.headers["x-wc-webhook-event"] ||
+      ""
+  ).toLowerCase();
+
+  console.log(
+    `[WooCommerce Webhook] topic=${topic || "unknown"} id=${body?.id} sku=${body?.sku} name=${body?.name}`
+  );
+
+  // Ignore deletes
+  if (topic === "product.deleted") {
+    console.log("[WooCommerce Webhook] product.deleted – inventory unchanged");
+    return;
+  }
 
   if (!body || (!body.id && !body.sku && !body.name)) {
     console.log("[WooCommerce Webhook] Empty or test payload – ignored");
     return;
   }
 
-  processWebhookPayload(body).catch((err) => {
+  processWebhookPayload(body, topic).catch((err) => {
     console.error("[WooCommerce Webhook] Unhandled background error:", err);
   });
-}
+};
