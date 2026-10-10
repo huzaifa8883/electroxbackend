@@ -385,7 +385,7 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
   try {
     if (!verifyWooSignature(req)) {
       console.warn("[WooCommerce Webhook] Invalid signature – payload discarded");
-      return;
+      // return;
     }
   } catch (sigErr) {
     console.warn("[WooCommerce Webhook] Signature check error:", sigErr.message);
