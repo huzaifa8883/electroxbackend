@@ -98,9 +98,9 @@ function normalizeImages(images, image_url) {
 exports.createProduct = async (req, res) => {
   const {
     sku, name, category, stock = 0, min_stock = 5,
-    cost_price = 0, selling_price = 0, supplier_id, box_id,
-    image_url, location, description, characteristics, images,
-    short_description, meta_description, tags, focus_keyword, weight,
+    cost_price = 0, selling_price = 0, regular_price = 0, supplier_id, box_id,
+    image_url, description, images,
+    meta_description, tags, focus_keyword, weight,
     sync_to_website = true,
   } = req.body;
 
@@ -115,20 +115,22 @@ exports.createProduct = async (req, res) => {
   try {
     await client.query("BEGIN");
 
+    const reg = Number(regular_price) || Number(selling_price) || 0;
+    const sale = Number(selling_price) || 0;
     const { rows } = await client.query(
       `INSERT INTO products
-        (sku, name, category, stock, min_stock, cost_price, selling_price,
-         supplier_id, box_id, image_url, images, description, characteristics, location,
-         short_description, meta_description, tags, focus_keyword, weight, sync_to_website)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+        (sku, name, category, stock, min_stock, cost_price, selling_price, regular_price,
+         supplier_id, box_id, image_url, images, description,
+         meta_description, tags, focus_keyword, weight, sync_to_website)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
        RETURNING *`,
       [
         sku, name, category || null,
         Number(stock) || 0, Number(min_stock) || 5,
-        Number(cost_price) || 0, Number(selling_price) || 0,
+        Number(cost_price) || 0, sale, reg,
         supplier_id || null, box_id || null,
-        cover, imgs, description || null, characteristics || null, location || null,
-        short_description || null, meta_description || null, tags || null,
+        cover, imgs, description || null,
+        meta_description || null, tags || null,
         focus_keyword || null, Number(weight) || 0,
         sync_to_website === false || sync_to_website === "false" ? false : true,
       ]
@@ -160,12 +162,36 @@ exports.createProduct = async (req, res) => {
     await client.query("ROLLBACK");
     console.error(err);
     if (err.code === "23505") return res.status(409).json({ error: "SKU already exists" });
-    // Missing column? hint migration
     if (err.message && err.message.includes("column")) {
-      return res.status(500).json({
-        error: "Database missing website fields. Run migrate_website_fields.sql as DB owner.",
-        detail: err.message,
-      });
+      console.error("[createProduct] column missing, retrying without website fields:", err.message);
+      try {
+        const imgs2 = normalizeImages(req.body.images, req.body.image_url);
+        const cover2 = imgs2[0] || req.body.image_url || null;
+        const { rows: rows2 } = await pool.query(
+          `INSERT INTO products
+            (sku, name, category, stock, min_stock, cost_price, selling_price,
+             supplier_id, box_id, image_url, images, description, characteristics, location)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+           RETURNING *`,
+          [
+            req.body.sku, req.body.name, req.body.category || null,
+            Number(req.body.stock) || 0, Number(req.body.min_stock) || 5,
+            Number(req.body.cost_price) || 0, Number(req.body.selling_price) || 0,
+            req.body.supplier_id || null, req.body.box_id || null,
+            cover2, imgs2, req.body.description || null, req.body.characteristics || null, req.body.location || null,
+          ]
+        );
+        const product2 = rows2[0];
+        let website = null, website_error = "Run migrate_website_fields.sql to enable SEO fields + full website sync meta";
+        try { website = await syncProductToWoo({ ...product2, ...req.body }); } catch (e) { website_error = e.message; }
+        return res.status(201).json({ ...product2, website, website_error });
+      } catch (err2) {
+        console.error(err2);
+        return res.status(500).json({
+          error: "Database missing website fields. Run as postgres: psql -U postgres -d electrox_pro -f migrate_website_fields.sql",
+          detail: err.message,
+        });
+      }
     }
     res.status(500).json({ error: "Failed to create product" });
   } finally {
@@ -179,9 +205,9 @@ exports.updateProduct = async (req, res) => {
   const body = req.body || {};
 
   const fields = [
-    "sku", "name", "category", "min_stock", "cost_price", "selling_price",
-    "supplier_id", "box_id", "location", "description", "characteristics",
-    "short_description", "meta_description", "tags", "focus_keyword", "weight",
+    "sku", "name", "category", "min_stock", "cost_price", "selling_price", "regular_price",
+    "supplier_id", "box_id", "description",
+    "meta_description", "tags", "focus_keyword", "weight",
     "sync_to_website",
   ];
 
@@ -205,7 +231,7 @@ exports.updateProduct = async (req, res) => {
     fields.forEach((f) => {
       if (body[f] !== undefined) {
         let val = body[f];
-        if (["min_stock", "cost_price", "selling_price", "weight"].includes(f)) val = Number(val) || 0;
+        if (["min_stock", "cost_price", "selling_price", "regular_price", "weight"].includes(f)) val = Number(val) || 0;
         if (["supplier_id", "box_id"].includes(f) && (val === "" || val === null)) val = null;
         if (f === "sync_to_website") val = val === false || val === "false" ? false : true;
         values.push(val);
@@ -340,7 +366,16 @@ exports.deleteProduct = async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // Check if product is used in any sale
+    const { rows: prodRows } = await client.query(
+      `SELECT * FROM products WHERE id = $1 FOR UPDATE`,
+      [id]
+    );
+    if (!prodRows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Product not found" });
+    }
+    const product = prodRows[0];
+
     const { rows: saleCheck } = await client.query(
       `SELECT COUNT(*)::int AS cnt FROM sale_items WHERE product_id = $1`,
       [id]
@@ -352,8 +387,6 @@ exports.deleteProduct = async (req, res) => {
       });
     }
 
-    // purchase_orders references with ON DELETE SET NULL — fine
-    // stock_ledger has ON DELETE CASCADE — fine
     const { rowCount } = await client.query(`DELETE FROM products WHERE id = $1`, [id]);
     if (!rowCount) {
       await client.query("ROLLBACK");
@@ -361,11 +394,30 @@ exports.deleteProduct = async (req, res) => {
     }
 
     await client.query("COMMIT");
-    res.json({ success: true });
+
+    // Also delete from website (best-effort)
+    let website_error = null;
+    try {
+      const { wcClient } = require("./wooSync");
+      const clientWoo = wcClient();
+      if (clientWoo && product.sku) {
+        const { data: found } = await clientWoo.get("/products", {
+          params: { sku: product.sku, per_page: 1 },
+        });
+        if (Array.isArray(found) && found.length) {
+          await clientWoo.delete(`/products/${found[0].id}`, { params: { force: true } });
+          console.log("[deleteProduct] deleted from website id=", found[0].id);
+        }
+      }
+    } catch (e) {
+      website_error = e.message;
+      console.error("[deleteProduct] website delete:", e.message);
+    }
+
+    res.json({ success: true, website_error });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error(err);
-    // FK violation fallback
     if (err.code === "23503") {
       return res.status(409).json({
         error: "Cannot delete this product because it is linked to sales or other records.",
