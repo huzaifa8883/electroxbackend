@@ -109,6 +109,42 @@ function mapWooCategories(wooCategories = []) {
   return sorted[0]?.original || "Uncategorized";
 }
 
+function getMetaValue(wooProduct, keys) {
+  const list = Array.isArray(wooProduct.meta_data) ? wooProduct.meta_data : [];
+  const want = keys.map((k) => String(k).toLowerCase());
+  for (const m of list) {
+    const key = String(m.key || m.meta_key || "").toLowerCase();
+    if (want.includes(key)) {
+      const v = m.value !== undefined ? m.value : m.meta_value;
+      if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+    }
+  }
+  return null;
+}
+
+async function resolveBoxId(boxNumber) {
+  if (!boxNumber) return null;
+  const num = String(boxNumber).trim();
+  if (!num) return null;
+  const existing = await pool.query(
+    `SELECT id FROM boxes WHERE box_number = $1 LIMIT 1`,
+    [num]
+  );
+  if (existing.rows.length) return existing.rows[0].id;
+  try {
+    const created = await pool.query(
+      `INSERT INTO boxes (box_number, description)
+       VALUES ($1, $2)
+       ON CONFLICT (box_number) DO UPDATE SET box_number = EXCLUDED.box_number
+       RETURNING id`,
+      [num, "Created from website product"]
+    );
+    return created.rows[0].id;
+  } catch {
+    return null;
+  }
+}
+
 async function upsertProduct(wooProduct) {
   const sku =
     (wooProduct.sku && String(wooProduct.sku).trim()) ||
@@ -126,6 +162,20 @@ async function upsertProduct(wooProduct) {
     wooProduct.description || wooProduct.short_description || ""
   );
 
+  const costRaw = getMetaValue(wooProduct, ["_cost_price", "cost_price"]);
+  const costPrice =
+    costRaw !== null && costRaw !== undefined && String(costRaw).trim() !== ""
+      ? Number(costRaw) || 0
+      : null;
+
+  const boxNumber = getMetaValue(wooProduct, [
+    "_inventory_box",
+    "inventory_box",
+    "_box",
+    "box",
+  ]);
+  const boxId = await resolveBoxId(boxNumber);
+
   let images = [];
   if (Array.isArray(wooProduct.images) && wooProduct.images.length > 0) {
     images = wooProduct.images.map((img) => img.src || img.url).filter(Boolean);
@@ -134,15 +184,17 @@ async function upsertProduct(wooProduct) {
 
   const { rows } = await pool.query(
     `INSERT INTO products (
-       sku, name, category, stock, selling_price,
+       sku, name, category, stock, selling_price, cost_price, box_id,
        image_url, images, description, min_stock
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 5)
+     VALUES ($1, $2, $3, $4, $5, COALESCE($6, 0), $7, $8, $9, $10, 5)
      ON CONFLICT (sku) DO UPDATE SET
        name          = EXCLUDED.name,
        category      = EXCLUDED.category,
        stock         = EXCLUDED.stock,
        selling_price = EXCLUDED.selling_price,
+       cost_price    = COALESCE($6, products.cost_price),
+       box_id        = COALESCE($7, products.box_id),
        image_url     = COALESCE(EXCLUDED.image_url, products.image_url),
        images        = CASE
                          WHEN EXCLUDED.images IS NOT NULL AND array_length(EXCLUDED.images, 1) > 0
@@ -150,8 +202,8 @@ async function upsertProduct(wooProduct) {
                          ELSE products.images
                        END,
        description   = EXCLUDED.description
-     RETURNING id, sku, name, category`,
-    [sku, name, category, stock, sellingPrice, imageUrl, images, description]
+     RETURNING id, sku, name, category, cost_price, box_id`,
+    [sku, name, category, stock, sellingPrice, costPrice, boxId, imageUrl, images, description]
   );
   return rows[0];
 }
