@@ -1,6 +1,12 @@
-
 const pool = require("../config/db");
-const { syncProductToWoo } = require("../services/wooSync");
+
+// Optional: inventory → website sync (do not crash app if file missing)
+let syncProductToWoo = async () => null;
+try {
+  syncProductToWoo = require("./wooSync").syncProductToWoo;
+} catch (e) {
+  console.warn("[productsController] wooSync.js not loaded — website push disabled:", e.message);
+}
 
 // POST /api/products/upload-image — multipart/form-data field "image"
 exports.uploadImage = async (req, res) => {
