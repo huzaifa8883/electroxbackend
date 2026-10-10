@@ -1,4 +1,6 @@
+
 const pool = require("../config/db");
+const { syncProductToWoo } = require("../services/wooSync");
 
 // POST /api/products/upload-image — multipart/form-data field "image"
 exports.uploadImage = async (req, res) => {
@@ -92,6 +94,8 @@ exports.createProduct = async (req, res) => {
     sku, name, category, stock = 0, min_stock = 5,
     cost_price = 0, selling_price = 0, supplier_id, box_id,
     image_url, location, description, characteristics, images,
+    short_description, meta_description, tags, focus_keyword, weight,
+    sync_to_website = true,
   } = req.body;
 
   if (!sku || !name) {
@@ -108,8 +112,9 @@ exports.createProduct = async (req, res) => {
     const { rows } = await client.query(
       `INSERT INTO products
         (sku, name, category, stock, min_stock, cost_price, selling_price,
-         supplier_id, box_id, image_url, images, description, characteristics, location)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         supplier_id, box_id, image_url, images, description, characteristics, location,
+         short_description, meta_description, tags, focus_keyword, weight, sync_to_website)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
        RETURNING *`,
       [
         sku, name, category || null,
@@ -117,9 +122,11 @@ exports.createProduct = async (req, res) => {
         Number(cost_price) || 0, Number(selling_price) || 0,
         supplier_id || null, box_id || null,
         cover, imgs, description || null, characteristics || null, location || null,
+        short_description || null, meta_description || null, tags || null,
+        focus_keyword || null, Number(weight) || 0,
+        sync_to_website === false || sync_to_website === "false" ? false : true,
       ]
     );
-
     const product = rows[0];
 
     if (Number(stock) > 0) {
@@ -131,11 +138,29 @@ exports.createProduct = async (req, res) => {
     }
 
     await client.query("COMMIT");
-    res.status(201).json(product);
+
+    // Push to website (non-fatal)
+    let website = null;
+    let website_error = null;
+    try {
+      website = await syncProductToWoo(product);
+    } catch (e) {
+      website_error = e.message;
+      console.error("[createProduct] website sync:", e.message);
+    }
+
+    res.status(201).json({ ...product, website, website_error });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error(err);
     if (err.code === "23505") return res.status(409).json({ error: "SKU already exists" });
+    // Missing column? hint migration
+    if (err.message && err.message.includes("column")) {
+      return res.status(500).json({
+        error: "Database missing website fields. Run migrate_website_fields.sql as DB owner.",
+        detail: err.message,
+      });
+    }
     res.status(500).json({ error: "Failed to create product" });
   } finally {
     client.release();
@@ -147,17 +172,17 @@ exports.updateProduct = async (req, res) => {
   const { id } = req.params;
   const body = req.body || {};
 
-  // Fields we can set directly (stock handled separately via ledger)
   const fields = [
     "sku", "name", "category", "min_stock", "cost_price", "selling_price",
     "supplier_id", "box_id", "location", "description", "characteristics",
+    "short_description", "meta_description", "tags", "focus_keyword", "weight",
+    "sync_to_website",
   ];
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    // Load current product
     const { rows: currentRows } = await client.query(
       `SELECT * FROM products WHERE id = $1 FOR UPDATE`,
       [id]
@@ -174,14 +199,14 @@ exports.updateProduct = async (req, res) => {
     fields.forEach((f) => {
       if (body[f] !== undefined) {
         let val = body[f];
-        if (["min_stock", "cost_price", "selling_price"].includes(f)) val = Number(val) || 0;
+        if (["min_stock", "cost_price", "selling_price", "weight"].includes(f)) val = Number(val) || 0;
         if (["supplier_id", "box_id"].includes(f) && (val === "" || val === null)) val = null;
+        if (f === "sync_to_website") val = val === false || val === "false" ? false : true;
         values.push(val);
         updates.push(`${f} = $${values.length}`);
       }
     });
 
-    // Handle images array
     if (body.images !== undefined || body.image_url !== undefined) {
       const cover = body.image_url !== undefined ? body.image_url : current.image_url;
       const imgs = normalizeImages(
@@ -195,28 +220,23 @@ exports.updateProduct = async (req, res) => {
       updates.push(`images = $${values.length}`);
     }
 
-    // Stock change: write ledger entry and update stock
     if (body.stock !== undefined) {
       const newStock = Number(body.stock);
-      if (isNaN(newStock) || newStock < 0) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({ error: "stock must be a non-negative number" });
-      }
-      const delta = newStock - Number(current.stock);
-      if (delta !== 0) {
+      if (!Number.isNaN(newStock) && newStock !== Number(current.stock)) {
+        const delta = newStock - Number(current.stock);
         values.push(newStock);
         updates.push(`stock = $${values.length}`);
         await client.query(
           `INSERT INTO stock_ledger (product_id, type, quantity_changed, balance_after, reference)
            VALUES ($1, 'adjustment', $2, $3, $4)`,
-          [id, delta, newStock, "Stock updated via product edit"]
+          [id, delta, newStock, body.stock_note || "Manual stock edit"]
         );
       }
     }
 
     if (!updates.length) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ error: "No fields to update" });
+      return res.json(current);
     }
 
     values.push(id);
@@ -226,7 +246,18 @@ exports.updateProduct = async (req, res) => {
     );
 
     await client.query("COMMIT");
-    res.json(rows[0]);
+    const product = rows[0];
+
+    let website = null;
+    let website_error = null;
+    try {
+      website = await syncProductToWoo(product);
+    } catch (e) {
+      website_error = e.message;
+      console.error("[updateProduct] website sync:", e.message);
+    }
+
+    res.json({ ...product, website, website_error });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error(err);
