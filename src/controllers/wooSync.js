@@ -1,3 +1,4 @@
+
 /**
  * Push inventory product → WooCommerce (create or update by SKU).
  * Requires in .env:
@@ -124,20 +125,32 @@ async function syncProductToWoo(product) {
   const imgs = Array.isArray(product.images) ? product.images : [];
   const cover = product.image_url;
   const all = cover ? [cover, ...imgs.filter((u) => u !== cover)] : imgs;
-  for (const src of all.filter(Boolean).slice(0, 7)) {
-    // Relative /uploads → absolute using WEBSITE or API public URL
-    let url = src;
-    if (url.startsWith("/")) {
-      const apiBase = (process.env.PUBLIC_API_URL || process.env.WC_STORE_URL || "").replace(
-        /\/$/,
-        ""
-      );
-      // Prefer inventory API host for uploaded images
-      const inv = (process.env.PUBLIC_API_URL || "").replace(/\/$/, "");
-      url = inv ? `${inv}${src}` : src;
-    }
-    images.push({ src: url });
+
+  // Base URL for inventory-hosted uploads (must be publicly reachable by WordPress)
+  const publicBase = (
+    process.env.PUBLIC_API_URL ||
+    process.env.INVENTORY_PUBLIC_URL ||
+    "https://electroxbackend.work.gd"
+  ).replace(/\/$/, "");
+
+  function toAbsoluteImageUrl(src) {
+    if (!src) return null;
+    let url = String(src).trim();
+    if (!url) return null;
+    // Already absolute
+    if (/^https?:\/\//i.test(url)) return url;
+    // Protocol-relative
+    if (url.startsWith("//")) return "https:" + url;
+    // Relative path e.g. /uploads/products/xxx.webp
+    if (!url.startsWith("/")) url = "/" + url;
+    return publicBase + url;
   }
+
+  for (const src of all.filter(Boolean).slice(0, 7)) {
+    const url = toAbsoluteImageUrl(src);
+    if (url) images.push({ src: url });
+  }
+  console.log("[WooSync] images for", product.sku, images.map((i) => i.src));
 
   const categoryId = await findCategoryId(client, product.category);
   const tags = await resolveTags(client, product.tags);
