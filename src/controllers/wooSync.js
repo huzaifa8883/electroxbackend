@@ -1,4 +1,3 @@
-
 /**
  * Push inventory product → WooCommerce (create or update by SKU).
  * Requires in .env:
@@ -168,13 +167,19 @@ async function syncProductToWoo(product) {
     { key: "_yoast_wpseo_focuskw", value: product.focus_keyword || "" },
   ];
 
+  const regular = Number(product.regular_price) || Number(product.selling_price) || 0;
+  const sale = Number(product.selling_price) || 0;
+  // If sale < regular and sale > 0, send both; else only regular
+  const onSale = sale > 0 && regular > 0 && sale < regular;
+
   const payload = {
     name: product.name,
     sku: product.sku,
     type: "simple",
-    regular_price: String(product.selling_price ?? "0"),
+    regular_price: String(regular),
+    sale_price: onSale ? String(sale) : "",
     description: product.description || "",
-    short_description: product.short_description || "",
+    short_description: "",
     manage_stock: true,
     stock_quantity: Number(product.stock) || 0,
     weight: product.weight != null ? String(product.weight) : "",
