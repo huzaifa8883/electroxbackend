@@ -275,15 +275,50 @@ async function syncToDatabase(wooProduct) {
     const stock =
       hasStockQty ? Number(wooProduct.stock_quantity) || 0 : null;
 
-    const sellingPrice =
-      Number(wooProduct.sale_price) ||
+    const regularPrice =
       Number(wooProduct.regular_price) ||
       Number(wooProduct.price) ||
       0;
+    const salePriceRaw = wooProduct.sale_price;
+    const salePrice =
+      salePriceRaw !== undefined &&
+      salePriceRaw !== null &&
+      String(salePriceRaw).trim() !== ""
+        ? Number(salePriceRaw) || 0
+        : 0;
+    // selling_price = active price (sale if set, else regular) — used by POS
+    const sellingPrice = salePrice > 0 ? salePrice : regularPrice;
 
     const description = stripHtml(
       wooProduct.description || wooProduct.short_description || ""
     );
+
+    // SEO + tags from Woo / Rank Math / Yoast
+    const tagsArr = Array.isArray(wooProduct.tags)
+      ? wooProduct.tags.map((t) => t.name || t).filter(Boolean)
+      : [];
+    const tagsStr = tagsArr.join(", ");
+
+    const metaDescRaw =
+      getMetaEntry(wooProduct, [
+        "rank_math_description",
+        "_yoast_wpseo_metadesc",
+        "meta_description",
+      ]) || "";
+    const focusRaw =
+      getMetaEntry(wooProduct, [
+        "rank_math_focus_keyword",
+        "_yoast_wpseo_focuskw",
+        "focus_keyword",
+      ]) || "";
+    const metaDescription = String(metaDescRaw || "").trim();
+    const focusKeyword = String(focusRaw || "").trim();
+
+    const weightRaw = wooProduct.weight;
+    const weightVal =
+      weightRaw !== undefined && weightRaw !== null && String(weightRaw).trim() !== ""
+        ? Number(weightRaw) || 0
+        : null;
 
     const costRaw = getMetaEntry(wooProduct, ["_cost_price", "cost_price"]);
     const hasCostMeta = costRaw !== undefined;
@@ -324,8 +359,26 @@ async function syncToDatabase(wooProduct) {
         `selling_price = $3`,
         `description = $4`,
         `sku = $5`,
+        `regular_price = $6`,
       ];
-      const vals = [name, category, sellingPrice, description, sku];
+      const vals = [name, category, sellingPrice, description, sku, regularPrice];
+
+      if (tagsStr) {
+        vals.push(tagsStr);
+        sets.push(`tags = $${vals.length}`);
+      }
+      if (metaDescription) {
+        vals.push(metaDescription);
+        sets.push(`meta_description = $${vals.length}`);
+      }
+      if (focusKeyword) {
+        vals.push(focusKeyword);
+        sets.push(`focus_keyword = $${vals.length}`);
+      }
+      if (weightVal !== null) {
+        vals.push(weightVal);
+        sets.push(`weight = $${vals.length}`);
+      }
 
       if (stock !== null) {
         vals.push(stock);
@@ -361,24 +414,30 @@ async function syncToDatabase(wooProduct) {
     } else {
       const { rows: inserted } = await pool.query(
         `INSERT INTO products (
-           sku, name, category, stock, selling_price, cost_price, box_id,
-           image_url, images, description, min_stock
+           sku, name, category, stock, selling_price, regular_price, cost_price, box_id,
+           image_url, images, description, min_stock,
+           tags, meta_description, focus_keyword, weight
          )
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,5)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,5,$12,$13,$14,$15)
          ON CONFLICT (sku) DO UPDATE SET
-           name          = EXCLUDED.name,
-           category      = EXCLUDED.category,
-           stock         = COALESCE(EXCLUDED.stock, products.stock),
-           selling_price = EXCLUDED.selling_price,
-           cost_price    = COALESCE(EXCLUDED.cost_price, products.cost_price),
-           box_id        = COALESCE(EXCLUDED.box_id, products.box_id),
-           image_url     = COALESCE(EXCLUDED.image_url, products.image_url),
-           images        = CASE
-                             WHEN EXCLUDED.images IS NOT NULL AND array_length(EXCLUDED.images, 1) > 0
-                             THEN EXCLUDED.images
-                             ELSE products.images
-                           END,
-           description   = EXCLUDED.description
+           name             = EXCLUDED.name,
+           category         = EXCLUDED.category,
+           stock            = COALESCE(EXCLUDED.stock, products.stock),
+           selling_price    = EXCLUDED.selling_price,
+           regular_price    = EXCLUDED.regular_price,
+           cost_price       = COALESCE(EXCLUDED.cost_price, products.cost_price),
+           box_id           = COALESCE(EXCLUDED.box_id, products.box_id),
+           image_url        = COALESCE(EXCLUDED.image_url, products.image_url),
+           images           = CASE
+                                WHEN EXCLUDED.images IS NOT NULL AND array_length(EXCLUDED.images, 1) > 0
+                                THEN EXCLUDED.images
+                                ELSE products.images
+                              END,
+           description      = EXCLUDED.description,
+           tags             = COALESCE(EXCLUDED.tags, products.tags),
+           meta_description = COALESCE(EXCLUDED.meta_description, products.meta_description),
+           focus_keyword    = COALESCE(EXCLUDED.focus_keyword, products.focus_keyword),
+           weight           = COALESCE(EXCLUDED.weight, products.weight)
          RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
         [
           sku,
@@ -386,11 +445,16 @@ async function syncToDatabase(wooProduct) {
           category,
           stock !== null ? stock : 0,
           sellingPrice,
+          regularPrice,
           hasCostMeta ? costPrice : 0,
           hasBoxMeta ? boxId : null,
           imageUrl,
           images,
           description,
+          tagsStr || null,
+          metaDescription || null,
+          focusKeyword || null,
+          weightVal !== null ? weightVal : 0,
         ]
       );
       rows = inserted;
@@ -559,9 +623,26 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
     console.warn("[WooCommerce Webhook] Signature check error:", sigErr.message);
   }
 
-  if (topic === "product.deleted") {
-    console.log("[WooCommerce Webhook] product.deleted – inventory unchanged");
-    return res.status(200).json({ success: true, message: "deleted ignored" });
+  if (topic === "product.deleted" || topic === "product.trashed") {
+    try {
+      const wooId = body?.id ? Number(body.id) : null;
+      const rawSku = body?.sku && String(body.sku).trim();
+      const sku = rawSku || (wooId ? `WC-${wooId}` : null);
+      let deleted = 0;
+      if (sku) {
+        const r = await pool.query(`DELETE FROM products WHERE sku = $1 RETURNING id, sku`, [sku]);
+        deleted = r.rowCount || 0;
+      }
+      if (!deleted && wooId) {
+        const r2 = await pool.query(`DELETE FROM products WHERE sku = $1 RETURNING id, sku`, [`WC-${wooId}`]);
+        deleted = r2.rowCount || 0;
+      }
+      console.log(`[WooCommerce Webhook] 🗑️ DELETED from inventory sku=${sku} count=${deleted}`);
+      return res.status(200).json({ success: true, message: "deleted", deleted });
+    } catch (err) {
+      console.error("[WooCommerce Webhook] delete failed:", err.message);
+      return res.status(500).json({ success: false, error: err.message });
+    }
   }
 
   if (!body || (!body.id && !body.sku && !body.name)) {
