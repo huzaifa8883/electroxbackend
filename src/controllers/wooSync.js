@@ -82,7 +82,7 @@ async function resolveTags(client, tagsStr) {
       }
       if (tag) out.push({ id: tag.id });
     } catch (err) {
-      console.error("[WooSync] tag failed:", name, err.message);
+      console.warn("[WooSync] tag skip:", name, err.response?.status || err.message);
     }
   }
   return out;
@@ -154,17 +154,21 @@ async function syncProductToWoo(product) {
   const categoryId = await findCategoryId(client, product.category);
   const tags = await resolveTags(client, product.tags);
 
+  const focus = (product.focus_keyword || "").trim();
+  const metaDesc = (product.meta_description || "").trim();
   const meta_data = [
     { key: "_cost_price", value: String(product.cost_price ?? "0") },
     { key: "cost_price", value: String(product.cost_price ?? "0") },
     { key: "_inventory_box", value: boxNumber || "" },
     { key: "inventory_box", value: boxNumber || "" },
-    // Rank Math
-    { key: "rank_math_description", value: product.meta_description || "" },
-    { key: "rank_math_focus_keyword", value: product.focus_keyword || "" },
-    // Yoast
-    { key: "_yoast_wpseo_metadesc", value: product.meta_description || "" },
-    { key: "_yoast_wpseo_focuskw", value: product.focus_keyword || "" },
+    // Rank Math SEO
+    { key: "rank_math_description", value: metaDesc },
+    { key: "rank_math_focus_keyword", value: focus },
+    { key: "rank_math_focus_keyword_base", value: focus },
+    // Yoast SEO
+    { key: "_yoast_wpseo_metadesc", value: metaDesc },
+    { key: "_yoast_wpseo_focuskw", value: focus },
+    { key: "_yoast_wpseo_focuskw_text_input", value: focus },
   ];
 
   const regular = Number(product.regular_price) || Number(product.selling_price) || 0;
@@ -206,6 +210,17 @@ async function syncProductToWoo(product) {
       const { data } = await client.post("/products", payload);
       result = data;
       console.log(`[WooSync] ✅ Created website product id=${data.id} sku=${product.sku}`);
+    }
+    // Save woo product id on inventory row for reliable deletes
+    if (result?.id && product.id) {
+      try {
+        await pool.query(
+          `UPDATE products SET woo_product_id = $1 WHERE id = $2`,
+          [result.id, product.id]
+        );
+      } catch (e) {
+        console.warn("[WooSync] could not save woo_product_id:", e.message);
+      }
     }
     return result;
   } catch (err) {
