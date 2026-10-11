@@ -1,3 +1,4 @@
+
 /**
  * Pull ALL WooCommerce products into inventory (full fields).
  *
@@ -113,8 +114,8 @@ async function upsertProduct(wooProduct) {
     `INSERT INTO products (
        sku, name, category, stock, selling_price, regular_price, cost_price, box_id,
        image_url, images, description, min_stock,
-       tags, meta_description, focus_keyword, weight
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,5,$12,$13,$14,$15)
+       tags, meta_description, focus_keyword, weight, woo_product_id
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,5,$12,$13,$14,$15,$16)
      ON CONFLICT (sku) DO UPDATE SET
        name = EXCLUDED.name,
        category = EXCLUDED.category,
@@ -129,12 +130,13 @@ async function upsertProduct(wooProduct) {
        tags = EXCLUDED.tags,
        meta_description = EXCLUDED.meta_description,
        focus_keyword = EXCLUDED.focus_keyword,
-       weight = EXCLUDED.weight
+       weight = EXCLUDED.weight,
+       woo_product_id = COALESCE(EXCLUDED.woo_product_id, products.woo_product_id)
      RETURNING id, sku, name`,
     [
       sku, name, category, stock, sellingPrice, regularPrice, costPrice, boxId,
       imageUrl, images, description,
-      tags || null, metaDescription || null, focusKeyword || null, weight,
+      tags || null, metaDescription || null, focusKeyword || null, weight, wooId,
     ]
   );
   return rows[0];
