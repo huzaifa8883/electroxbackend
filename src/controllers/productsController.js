@@ -147,17 +147,15 @@ exports.createProduct = async (req, res) => {
 
     await client.query("COMMIT");
 
-    // Push to website (non-fatal)
-    let website = null;
-    let website_error = null;
-    try {
-      website = await syncProductToWoo(product);
-    } catch (e) {
-      website_error = e.message;
-      console.error("[createProduct] website sync:", e.message);
-    }
-
-    res.status(201).json({ ...product, website, website_error });
+    // Respond immediately — website sync in background (fast UI, no double-click lag)
+    res.status(201).json({ ...product, website_sync: "queued" });
+    setImmediate(() => {
+      syncProductToWoo(product).then((w) => {
+        console.log("[createProduct] website sync OK", product.sku, w?.id);
+      }).catch((e) => {
+        console.error("[createProduct] website sync:", e.message);
+      });
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error(err);
@@ -280,16 +278,14 @@ exports.updateProduct = async (req, res) => {
     await client.query("COMMIT");
     const product = rows[0];
 
-    let website = null;
-    let website_error = null;
-    try {
-      website = await syncProductToWoo(product);
-    } catch (e) {
-      website_error = e.message;
-      console.error("[updateProduct] website sync:", e.message);
-    }
-
-    res.json({ ...product, website, website_error });
+    res.json({ ...product, website_sync: "queued" });
+    setImmediate(() => {
+      syncProductToWoo(product).then((w) => {
+        console.log("[updateProduct] website sync OK", product.sku, w?.id);
+      }).catch((e) => {
+        console.error("[updateProduct] website sync:", e.message);
+      });
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error(err);
