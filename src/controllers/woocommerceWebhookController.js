@@ -1,4 +1,3 @@
-
 const crypto = require("crypto");
 const axios = require("axios");
 const pool = require("../config/db");
@@ -299,6 +298,7 @@ async function syncToDatabase(wooProduct) {
       : [];
     const tagsStr = tagsArr.join(", ");
 
+    const shortDesc = stripHtml(wooProduct.short_description || "");
     const metaDescRaw =
       getMetaEntry(wooProduct, [
         "rank_math_description",
@@ -311,7 +311,8 @@ async function syncToDatabase(wooProduct) {
         "_yoast_wpseo_focuskw",
         "focus_keyword",
       ]) || "";
-    const metaDescription = String(metaDescRaw || "").trim();
+    // Meta description = SEO meta OR WordPress short description
+    const metaDescription = String(metaDescRaw || shortDesc || "").trim();
     const focusKeyword = String(focusRaw || "").trim();
 
     const weightRaw = wooProduct.weight;
@@ -363,18 +364,13 @@ async function syncToDatabase(wooProduct) {
       ];
       const vals = [name, category, sellingPrice, description, sku, regularPrice];
 
-      if (tagsStr) {
-        vals.push(tagsStr);
-        sets.push(`tags = $${vals.length}`);
-      }
-      if (metaDescription) {
-        vals.push(metaDescription);
-        sets.push(`meta_description = $${vals.length}`);
-      }
-      if (focusKeyword) {
-        vals.push(focusKeyword);
-        sets.push(`focus_keyword = $${vals.length}`);
-      }
+      // Always write SEO fields from website (short_description → meta_description)
+      vals.push(tagsStr || null);
+      sets.push(`tags = $${vals.length}`);
+      vals.push(metaDescription || null);
+      sets.push(`meta_description = $${vals.length}`);
+      vals.push(focusKeyword || null);
+      sets.push(`focus_keyword = $${vals.length}`);
       if (weightVal !== null) {
         vals.push(weightVal);
         sets.push(`weight = $${vals.length}`);
@@ -627,21 +623,48 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
     try {
       const wooId = body?.id ? Number(body.id) : null;
       const rawSku = body?.sku && String(body.sku).trim();
-      const sku = rawSku || (wooId ? `WC-${wooId}` : null);
-      let deleted = 0;
-      if (sku) {
-        const r = await pool.query(`DELETE FROM products WHERE sku = $1 RETURNING id, sku`, [sku]);
-        deleted = r.rowCount || 0;
+      console.log(`[WooCommerce Webhook] DELETE request id=${wooId} sku=${rawSku}`);
+
+      let deletedRows = [];
+      // 1) exact SKU
+      if (rawSku) {
+        const r = await pool.query(
+          `DELETE FROM products WHERE sku = $1 RETURNING id, sku`,
+          [rawSku]
+        );
+        deletedRows = r.rows;
       }
-      if (!deleted && wooId) {
-        const r2 = await pool.query(`DELETE FROM products WHERE sku = $1 RETURNING id, sku`, [`WC-${wooId}`]);
-        deleted = r2.rowCount || 0;
+      // 2) WC-{id} fallback
+      if (!deletedRows.length && wooId) {
+        const r2 = await pool.query(
+          `DELETE FROM products WHERE sku = $1 OR sku = $2 RETURNING id, sku`,
+          [`WC-${wooId}`, String(wooId)]
+        );
+        deletedRows = r2.rows;
       }
-      console.log(`[WooCommerce Webhook] 🗑️ DELETED from inventory sku=${sku} count=${deleted}`);
-      return res.status(200).json({ success: true, message: "deleted", deleted });
+      // 3) last resort: products whose sku ends with -{id} or equals id
+      if (!deletedRows.length && wooId) {
+        const r3 = await pool.query(
+          `DELETE FROM products WHERE sku ILIKE $1 RETURNING id, sku`,
+          [`%WC-${wooId}%`]
+        );
+        deletedRows = r3.rows;
+      }
+
+      console.log(
+        `[WooCommerce Webhook] 🗑️ DELETED from inventory count=${deletedRows.length}`,
+        deletedRows
+      );
+      return res.status(200).json({
+        success: true,
+        message: "deleted",
+        deleted: deletedRows.length,
+        rows: deletedRows,
+      });
     } catch (err) {
       console.error("[WooCommerce Webhook] delete failed:", err.message);
-      return res.status(500).json({ success: false, error: err.message });
+      // still 200 so WC does not disable webhook
+      return res.status(200).json({ success: false, error: err.message });
     }
   }
 
