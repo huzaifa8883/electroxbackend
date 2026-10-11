@@ -1,4 +1,3 @@
-
 /**
  * Pull ALL WooCommerce products into inventory (full fields).
  *
@@ -31,6 +30,22 @@ function mapWooCategories(wooCategories = []) {
     parent: c.parent || 0,
   }));
   const sorted = [...normalized].sort((a, b) => b.parent - a.parent);
+
+  // Normalize Computer category names
+  for (const item of sorted) {
+    const n = item.lower;
+    if (
+      n.includes("computer") ||
+      n.includes("networking") ||
+      n === "computer & accessories" ||
+      n === "computer and accessories" ||
+      n === "computer-accessories" ||
+      n === "computer-and-networking"
+    ) {
+      return "Computer and Networking";
+    }
+  }
+
   return sorted[0]?.original || "Uncategorized";
 }
 
