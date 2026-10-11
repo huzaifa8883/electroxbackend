@@ -1,10 +1,9 @@
 const crypto = require("crypto");
-const axios = require("axios");
 const pool = require("../config/db");
-const { postToFacebook, postToInstagram, buildCaption } = require("./socialPost");
+const { postToFacebook, postToInstagram } = require("./socialPost");
 
 // ─────────────────────────────────────────────────────────────
-// Signature verification (optional)
+// Signature verification (soft — don't block on mismatch)
 // ─────────────────────────────────────────────────────────────
 function verifyWooSignature(req) {
   const secret = process.env.WOOCOMMERCE_WEBHOOK_SECRET;
@@ -26,9 +25,6 @@ function verifyWooSignature(req) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────
 function stripHtml(html = "") {
   return String(html)
     .replace(/<[^>]*>/g, " ")
@@ -42,11 +38,6 @@ function stripHtml(html = "") {
     .trim();
 }
 
-/**
- * Dynamic Category Mapping
- * Website category → Inventory category (exact match for most)
- * Special rules for Cables subs, Chargers, Computer and Networking
- */
 function mapWooCategories(wooCategories = []) {
   if (!Array.isArray(wooCategories) || wooCategories.length === 0) {
     return "Uncategorized";
@@ -57,10 +48,8 @@ function mapWooCategories(wooCategories = []) {
     lower: (c.name || c.slug || "").trim().toLowerCase(),
     parent: c.parent || 0,
   }));
-
   const sorted = [...normalized].sort((a, b) => b.parent - a.parent);
 
-  // ─── Cables subcategories ───────────────────────────────────
   const cableSubMap = {
     "ac cables": "AC Cables",
     "ac cable": "AC Cables",
@@ -77,7 +66,6 @@ function mapWooCategories(wooCategories = []) {
     others: "Others",
     other: "Others",
   };
-
   for (const item of sorted) {
     for (const [key, label] of Object.entries(cableSubMap)) {
       if (item.lower === key || item.lower.includes(key)) {
@@ -85,12 +73,8 @@ function mapWooCategories(wooCategories = []) {
       }
     }
   }
+  if (sorted.some((i) => i.lower.includes("cable"))) return "Cables > Others";
 
-  if (sorted.some((i) => i.lower.includes("cable"))) {
-    return "Cables > Others";
-  }
-
-  // ─── Chargers (standalone main category) ────────────────────
   const chargerSubMap = {
     "battery chargers": "Battery Chargers",
     "battery charger": "Battery Chargers",
@@ -101,7 +85,6 @@ function mapWooCategories(wooCategories = []) {
     "wireless chargers": "Wireless Chargers",
     "wireless charger": "Wireless Chargers",
   };
-
   for (const item of sorted) {
     for (const [key, label] of Object.entries(chargerSubMap)) {
       if (item.lower === key || item.lower.includes(key)) {
@@ -109,12 +92,10 @@ function mapWooCategories(wooCategories = []) {
       }
     }
   }
-
   if (sorted.some((i) => i.lower.includes("charger") || i.lower.includes("charging"))) {
     return "Chargers > Battery Chargers";
   }
 
-  // ─── Computer and Networking ────────────────────────────────
   if (
     sorted.some(
       (i) =>
@@ -140,46 +121,125 @@ function mapWooCategories(wooCategories = []) {
         n.includes("modem")
       );
     });
-    if (specific) {
-      return `Computer and Networking > ${specific.original}`;
-    }
+    if (specific) return `Computer and Networking > ${specific.original}`;
     return "Computer and Networking";
   }
 
-  // ─── Everything else → exact name from website ──────────────
   return sorted[0]?.original || "Uncategorized";
 }
 
 // ─────────────────────────────────────────────────────────────
-// Background processor
+// DB sync (THIS WAS MISSING — root cause of the bug)
 // ─────────────────────────────────────────────────────────────
-async function processWebhookPayload(wooProduct, topic) {
-  // Always sync inventory on create + update
-  const jobs = [syncToDatabase(wooProduct)];
+async function syncToDatabase(wooProduct) {
+  const sku =
+    (wooProduct.sku && String(wooProduct.sku).trim()) ||
+    `WC-${wooProduct.id}`;
 
-  // Social posts only for brand-new products (avoid spam on every edit)
-  const isCreate =
-    !topic ||
-    topic === "product.created" ||
-    topic === "product.restored";
-  if (isCreate) {
-    jobs.push(postToFacebook(wooProduct));
-    jobs.push(postToInstagram(wooProduct));
+  const name = (wooProduct.name || "Untitled Product").trim();
+  const category = mapWooCategories(wooProduct.categories || []);
+  const stock = Number(wooProduct.stock_quantity) || 0;
+
+  const sellingPrice =
+    Number(wooProduct.sale_price) ||
+    Number(wooProduct.regular_price) ||
+    Number(wooProduct.price) ||
+    0;
+
+  // cost from meta if present
+  let costPrice = 0;
+  if (Array.isArray(wooProduct.meta_data)) {
+    const costMeta = wooProduct.meta_data.find(
+      (m) =>
+        m &&
+        (m.key === "_cost_price" ||
+          m.key === "cost_price" ||
+          m.key === "_wc_cog_cost")
+    );
+    if (costMeta) costPrice = Number(costMeta.value) || 0;
   }
 
-  const results = await Promise.allSettled(jobs);
-  results.forEach((r, i) => {
-    const labels = isCreate
-      ? ["DB Sync", "Facebook", "Instagram"]
-      : ["DB Sync"];
-    if (r.status === "rejected") {
-      console.error(`[WooCommerce Webhook] ${labels[i]} rejected:`, r.reason?.message || r.reason);
+  const description = stripHtml(
+    wooProduct.description || wooProduct.short_description || ""
+  );
+
+  let images = [];
+  if (Array.isArray(wooProduct.images) && wooProduct.images.length > 0) {
+    images = wooProduct.images
+      .map((img) => img.src || img.url)
+      .filter(Boolean);
+  }
+  const imageUrl = images[0] || null;
+
+  const wooId = wooProduct.id ? Number(wooProduct.id) : null;
+
+  // Try with woo_product_id column; fallback if column missing
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO products (
+         sku, name, category, stock, selling_price, cost_price,
+         image_url, images, description, min_stock, woo_product_id
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,5,$10)
+       ON CONFLICT (sku) DO UPDATE SET
+         name          = EXCLUDED.name,
+         category      = EXCLUDED.category,
+         stock         = EXCLUDED.stock,
+         selling_price = EXCLUDED.selling_price,
+         cost_price    = CASE WHEN EXCLUDED.cost_price > 0 THEN EXCLUDED.cost_price ELSE products.cost_price END,
+         image_url     = COALESCE(EXCLUDED.image_url, products.image_url),
+         images        = CASE
+                           WHEN EXCLUDED.images IS NOT NULL AND array_length(EXCLUDED.images, 1) > 0
+                           THEN EXCLUDED.images
+                           ELSE products.images
+                         END,
+         description   = EXCLUDED.description,
+         woo_product_id = COALESCE(EXCLUDED.woo_product_id, products.woo_product_id)
+       RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
+      [sku, name, category, stock, sellingPrice, costPrice, imageUrl, images, description, wooId]
+    );
+
+    console.log(
+      `[WooCommerce Webhook] ✅ Product synced → id=${rows[0].id} sku=${rows[0].sku} category="${rows[0].category}" images=${images.length}`
+    );
+    return rows[0];
+  } catch (err) {
+    // Column woo_product_id may not exist
+    if (err.message && err.message.includes("woo_product_id")) {
+      const { rows } = await pool.query(
+        `INSERT INTO products (
+           sku, name, category, stock, selling_price, cost_price,
+           image_url, images, description, min_stock
+         )
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,5)
+         ON CONFLICT (sku) DO UPDATE SET
+           name          = EXCLUDED.name,
+           category      = EXCLUDED.category,
+           stock         = EXCLUDED.stock,
+           selling_price = EXCLUDED.selling_price,
+           cost_price    = CASE WHEN EXCLUDED.cost_price > 0 THEN EXCLUDED.cost_price ELSE products.cost_price END,
+           image_url     = COALESCE(EXCLUDED.image_url, products.image_url),
+           images        = CASE
+                             WHEN EXCLUDED.images IS NOT NULL AND array_length(EXCLUDED.images, 1) > 0
+                             THEN EXCLUDED.images
+                             ELSE products.images
+                           END,
+           description   = EXCLUDED.description
+         RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
+        [sku, name, category, stock, sellingPrice, costPrice, imageUrl, images, description]
+      );
+      console.log(
+        `[WooCommerce Webhook] ✅ Product synced (no woo_id col) → id=${rows[0].id} sku=${rows[0].sku}`
+      );
+      return rows[0];
     }
-  });
+    console.error("[WooCommerce Webhook] ❌ Database sync failed:", err.message);
+    throw err;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
-// Main Express handler
+// Main handler
 // ─────────────────────────────────────────────────────────────
 exports.handleWooCommerceProductWebhook = async (req, res) => {
   const body = req.body || {};
@@ -191,42 +251,35 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
   ).toLowerCase();
 
   console.log(
-    `[WooCommerce Webhook] INCOMING topic=${topic || "unknown"} id=${body?.id} sku=${body?.sku} name=${body?.name} keys=${Object.keys(body).join(",")}`
+    `[WooCommerce Webhook] INCOMING topic=${topic || "unknown"} id=${body?.id} sku=${body?.sku} name=${body?.name}`
   );
 
-  // Respond AFTER we start work, but still quick — actually process sync AWAIT so we know it worked
-  // (Woo allows ~5s; our DB update is fast)
   try {
     if (!verifyWooSignature(req)) {
       console.warn("[WooCommerce Webhook] Invalid signature – continuing anyway");
     }
-  } catch (sigErr) {
-    console.warn("[WooCommerce Webhook] Signature check error:", sigErr.message);
+  } catch (e) {
+    console.warn("[WooCommerce Webhook] Signature check error:", e.message);
   }
 
-  if (topic === "product.deleted" || topic === "product.trashed") {
+  // DELETE
+  if (topic.includes("deleted") || topic.includes("trashed")) {
     try {
-      const wooId = body?.id ? Number(body.id) : null;
-      const rawSku = body?.sku && String(body.sku).trim();
-      console.log(`[WooCommerce Webhook] DELETE request id=${wooId} sku=${rawSku} keys=${Object.keys(body||{}).join(",")}`);
-
+      const wooId = body.id;
+      const rawSku = body.sku && String(body.sku).trim();
       let deletedRows = [];
 
-      // 1) by woo_product_id (most reliable when SKU missing)
       if (wooId) {
         try {
-          const r0 = await pool.query(
-            `DELETE FROM products WHERE woo_product_id = $1 RETURNING id, sku, woo_product_id`,
+          const r = await pool.query(
+            `DELETE FROM products WHERE woo_product_id = $1 RETURNING id, sku`,
             [wooId]
           );
-          deletedRows = r0.rows;
+          deletedRows = r.rows;
         } catch (colErr) {
-          // column may not exist yet
           console.warn("[WooCommerce Webhook] woo_product_id delete skip:", colErr.message);
         }
       }
-
-      // 2) exact SKU
       if (!deletedRows.length && rawSku) {
         const r = await pool.query(
           `DELETE FROM products WHERE sku = $1 RETURNING id, sku`,
@@ -234,8 +287,6 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
         );
         deletedRows = r.rows;
       }
-
-      // 3) WC-{id} fallback
       if (!deletedRows.length && wooId) {
         const r2 = await pool.query(
           `DELETE FROM products WHERE sku = $1 OR sku = $2 RETURNING id, sku`,
@@ -244,15 +295,11 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
         deletedRows = r2.rows;
       }
 
-      console.log(
-        `[WooCommerce Webhook] 🗑️ DELETED from inventory count=${deletedRows.length}`,
-        deletedRows
-      );
+      console.log(`[WooCommerce Webhook] 🗑️ deleted count=${deletedRows.length}`);
       return res.status(200).json({
         success: true,
         message: "deleted",
         deleted: deletedRows.length,
-        rows: deletedRows,
       });
     } catch (err) {
       console.error("[WooCommerce Webhook] delete failed:", err.message);
@@ -261,21 +308,19 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
   }
 
   if (!body || (!body.id && !body.sku && !body.name)) {
-    console.log("[WooCommerce Webhook] Empty or test payload – ignored");
+    console.log("[WooCommerce Webhook] Empty payload – ignored");
     return res.status(200).json({ success: true, message: "empty ignored" });
   }
 
   try {
-    // Await DB sync so create+update both definitely run before response
+    // 1) Always sync inventory (create + update)
     const row = await syncToDatabase(body);
-    // Social only on create (non-blocking)
-    const isCreate =
-      !topic ||
-      topic === "product.created" ||
-      topic === "product.restored";
-    if (isCreate) {
-      Promise.allSettled([postToFacebook(body), postToInstagram(body)]).catch(() => {});
-    }
+
+    // 2) Social on create AND update (so website products get FB/IG posts)
+    Promise.allSettled([postToFacebook(body), postToInstagram(body)]).catch(
+      () => {}
+    );
+
     return res.status(200).json({
       success: true,
       message: "synced",
@@ -296,7 +341,10 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
   }
 };
 
-// Health ping for WordPress to verify URL
 exports.webhookPing = async (req, res) => {
-  res.status(200).json({ ok: true, service: "electrox-inventory", time: new Date().toISOString() });
+  res.status(200).json({
+    ok: true,
+    service: "electrox-inventory",
+    time: new Date().toISOString(),
+  });
 };
