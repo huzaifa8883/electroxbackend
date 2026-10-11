@@ -132,9 +132,9 @@ function mapWooCategories(wooCategories = []) {
 // DB sync (THIS WAS MISSING — root cause of the bug)
 // ─────────────────────────────────────────────────────────────
 async function syncToDatabase(wooProduct) {
-  const sku =
-    (wooProduct.sku && String(wooProduct.sku).trim()) ||
-    `WC-${wooProduct.id}`;
+  const wooId = wooProduct.id ? Number(wooProduct.id) : null;
+  const rawSku = wooProduct.sku && String(wooProduct.sku).trim();
+  const sku = rawSku || (wooId ? `WC-${wooId}` : `WC-${Date.now()}`);
 
   const name = (wooProduct.name || "Untitled Product").trim();
   const category = mapWooCategories(wooProduct.categories || []);
@@ -146,7 +146,6 @@ async function syncToDatabase(wooProduct) {
     Number(wooProduct.price) ||
     0;
 
-  // cost from meta if present
   let costPrice = 0;
   if (Array.isArray(wooProduct.meta_data)) {
     const costMeta = wooProduct.meta_data.find(
@@ -165,15 +164,84 @@ async function syncToDatabase(wooProduct) {
 
   let images = [];
   if (Array.isArray(wooProduct.images) && wooProduct.images.length > 0) {
-    images = wooProduct.images
-      .map((img) => img.src || img.url)
-      .filter(Boolean);
+    images = wooProduct.images.map((img) => img.src || img.url).filter(Boolean);
   }
   const imageUrl = images[0] || null;
 
-  const wooId = wooProduct.id ? Number(wooProduct.id) : null;
+  // ─── 1) Existing row by woo_product_id ───
+  if (wooId) {
+    try {
+      const found = await pool.query(
+        `SELECT id FROM products WHERE woo_product_id = $1 LIMIT 1`,
+        [wooId]
+      );
+      if (found.rows.length) {
+        const { rows } = await pool.query(
+          `UPDATE products SET
+             sku = $1,
+             name = $2,
+             category = $3,
+             stock = $4,
+             selling_price = $5,
+             cost_price = CASE WHEN $6 > 0 THEN $6 ELSE cost_price END,
+             image_url = COALESCE($7, image_url),
+             images = CASE WHEN $8::text[] IS NOT NULL AND array_length($8::text[], 1) > 0 THEN $8 ELSE images END,
+             description = $9
+           WHERE id = $10
+           RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
+          [sku, name, category, stock, sellingPrice, costPrice, imageUrl, images, description, found.rows[0].id]
+        );
+        console.log(`[WooCommerce Webhook] ✅ UPDATED by woo_id → id=${rows[0].id} sku=${rows[0].sku}`);
+        return rows[0];
+      }
+    } catch (e) {
+      if (!String(e.message).includes("woo_product_id")) throw e;
+      // column missing — fall through
+    }
+  }
 
-  // Try with woo_product_id column; fallback if column missing
+  // ─── 2) Existing row by SKU ───
+  const bySku = await pool.query(
+    `SELECT id FROM products WHERE sku = $1 LIMIT 1`,
+    [sku]
+  );
+  if (bySku.rows.length) {
+    const { rows } = await pool.query(
+      `UPDATE products SET
+         name = $1,
+         category = $2,
+         stock = $3,
+         selling_price = $4,
+         cost_price = CASE WHEN $5 > 0 THEN $5 ELSE cost_price END,
+         image_url = COALESCE($6, image_url),
+         images = CASE WHEN $7::text[] IS NOT NULL AND array_length($7::text[], 1) > 0 THEN $7 ELSE images END,
+         description = $8,
+         woo_product_id = COALESCE($9, woo_product_id)
+       WHERE id = $10
+       RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
+      [name, category, stock, sellingPrice, costPrice, imageUrl, images, description, wooId, bySku.rows[0].id]
+    ).catch(async (err) => {
+      // woo_product_id column may not exist
+      if (String(err.message).includes("woo_product_id")) {
+        return pool.query(
+          `UPDATE products SET
+             name = $1, category = $2, stock = $3, selling_price = $4,
+             cost_price = CASE WHEN $5 > 0 THEN $5 ELSE cost_price END,
+             image_url = COALESCE($6, image_url),
+             images = CASE WHEN $7::text[] IS NOT NULL AND array_length($7::text[], 1) > 0 THEN $7 ELSE images END,
+             description = $8
+           WHERE id = $9
+           RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
+          [name, category, stock, sellingPrice, costPrice, imageUrl, images, description, bySku.rows[0].id]
+        );
+      }
+      throw err;
+    });
+    console.log(`[WooCommerce Webhook] ✅ UPDATED by sku → id=${rows[0].id} sku=${rows[0].sku}`);
+    return rows[0];
+  }
+
+  // ─── 3) Insert new ───
   try {
     const { rows } = await pool.query(
       `INSERT INTO products (
@@ -181,63 +249,40 @@ async function syncToDatabase(wooProduct) {
          image_url, images, description, min_stock, woo_product_id
        )
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,5,$10)
-       ON CONFLICT (sku) DO UPDATE SET
-         name          = EXCLUDED.name,
-         category      = EXCLUDED.category,
-         stock         = EXCLUDED.stock,
-         selling_price = EXCLUDED.selling_price,
-         cost_price    = CASE WHEN EXCLUDED.cost_price > 0 THEN EXCLUDED.cost_price ELSE products.cost_price END,
-         image_url     = COALESCE(EXCLUDED.image_url, products.image_url),
-         images        = CASE
-                           WHEN EXCLUDED.images IS NOT NULL AND array_length(EXCLUDED.images, 1) > 0
-                           THEN EXCLUDED.images
-                           ELSE products.images
-                         END,
-         description   = EXCLUDED.description,
-         woo_product_id = COALESCE(EXCLUDED.woo_product_id, products.woo_product_id)
        RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
       [sku, name, category, stock, sellingPrice, costPrice, imageUrl, images, description, wooId]
     );
-
-    console.log(
-      `[WooCommerce Webhook] ✅ Product synced → id=${rows[0].id} sku=${rows[0].sku} category="${rows[0].category}" images=${images.length}`
-    );
+    console.log(`[WooCommerce Webhook] ✅ CREATED → id=${rows[0].id} sku=${rows[0].sku}`);
     return rows[0];
   } catch (err) {
-    // Column woo_product_id may not exist
-    if (err.message && err.message.includes("woo_product_id")) {
+    if (String(err.message).includes("woo_product_id")) {
       const { rows } = await pool.query(
         `INSERT INTO products (
            sku, name, category, stock, selling_price, cost_price,
            image_url, images, description, min_stock
          )
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,5)
-         ON CONFLICT (sku) DO UPDATE SET
-           name          = EXCLUDED.name,
-           category      = EXCLUDED.category,
-           stock         = EXCLUDED.stock,
-           selling_price = EXCLUDED.selling_price,
-           cost_price    = CASE WHEN EXCLUDED.cost_price > 0 THEN EXCLUDED.cost_price ELSE products.cost_price END,
-           image_url     = COALESCE(EXCLUDED.image_url, products.image_url),
-           images        = CASE
-                             WHEN EXCLUDED.images IS NOT NULL AND array_length(EXCLUDED.images, 1) > 0
-                             THEN EXCLUDED.images
-                             ELSE products.images
-                           END,
-           description   = EXCLUDED.description
          RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
         [sku, name, category, stock, sellingPrice, costPrice, imageUrl, images, description]
       );
-      console.log(
-        `[WooCommerce Webhook] ✅ Product synced (no woo_id col) → id=${rows[0].id} sku=${rows[0].sku}`
+      console.log(`[WooCommerce Webhook] ✅ CREATED (no woo_id) → id=${rows[0].id} sku=${rows[0].sku}`);
+      return rows[0];
+    }
+    // unique sku race → update instead
+    if (err.code === "23505") {
+      const { rows } = await pool.query(
+        `UPDATE products SET
+           name = $1, category = $2, stock = $3, selling_price = $4,
+           image_url = COALESCE($5, image_url), description = $6
+         WHERE sku = $7
+         RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
+        [name, category, stock, sellingPrice, imageUrl, description, sku]
       );
       return rows[0];
     }
-    console.error("[WooCommerce Webhook] ❌ Database sync failed:", err.message);
     throw err;
   }
 }
-
 // ─────────────────────────────────────────────────────────────
 // Main handler
 // ─────────────────────────────────────────────────────────────
