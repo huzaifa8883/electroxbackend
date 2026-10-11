@@ -1,3 +1,4 @@
+
 /**
  * Push inventory product → WooCommerce (create or update by SKU).
  * Requires in .env:
@@ -195,23 +196,59 @@ async function syncProductToWoo(product) {
   if (categoryId) payload.categories = [{ id: categoryId }];
   if (tags.length) payload.tags = tags;
 
-  try {
-    // Find existing by SKU
-    const { data: found } = await client.get("/products", {
-      params: { sku: product.sku, per_page: 1 },
-    });
+  // allowCreate: false on updates (prevents duplicate products on stock/price edit)
+  const allowCreate = product._allowCreate !== false;
 
-    let result;
-    if (Array.isArray(found) && found.length > 0) {
-      const { data } = await client.put(`/products/${found[0].id}`, payload);
-      result = data;
-      console.log(`[WooSync] 🔄 Updated website product id=${data.id} sku=${product.sku}`);
-    } else {
+  try {
+    let result = null;
+    let existingId = product.woo_product_id ? Number(product.woo_product_id) : null;
+
+    // 1) Prefer woo_product_id — never creates a duplicate
+    if (existingId) {
+      try {
+        const { data } = await client.put(`/products/${existingId}`, payload);
+        result = data;
+        console.log(`[WooSync] 🔄 Updated by woo_id=${existingId} sku=${product.sku}`);
+      } catch (e) {
+        // 404 = product was deleted on website — clear id and fall through
+        if (e.response?.status === 404) {
+          console.warn(`[WooSync] woo_id=${existingId} not found on website, will search by SKU`);
+          existingId = null;
+        } else {
+          throw e;
+        }
+      }
+    }
+
+    // 2) Search by SKU
+    if (!result && product.sku) {
+      const { data: found } = await client.get("/products", {
+        params: { sku: product.sku, per_page: 5 },
+      });
+      const match = Array.isArray(found)
+        ? found.find((p) => String(p.sku || "").trim() === String(product.sku).trim())
+        : null;
+      if (match) {
+        const { data } = await client.put(`/products/${match.id}`, payload);
+        result = data;
+        console.log(`[WooSync] 🔄 Updated by SKU id=${match.id} sku=${product.sku}`);
+      }
+    }
+
+    // 3) Create only when explicitly allowed (new product from inventory)
+    if (!result) {
+      if (!allowCreate) {
+        console.warn(
+          `[WooSync] No website product found for sku=${product.sku} woo_id=${product.woo_product_id} — skip create (update-only)`
+        );
+        return null;
+      }
       const { data } = await client.post("/products", payload);
       result = data;
       console.log(`[WooSync] ✅ Created website product id=${data.id} sku=${product.sku}`);
     }
-    // Save woo product id on inventory row for reliable deletes
+
+    // Save woo product id on inventory row
     if (result?.id && product.id) {
       try {
         await pool.query(
