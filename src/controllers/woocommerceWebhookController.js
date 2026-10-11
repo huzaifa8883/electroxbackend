@@ -228,6 +228,15 @@ async function resolveBoxId(boxNumber) {
  * Tries: exact SKU → WC-{wooId} → any sku ending / matching patterns.
  */
 async function findExistingProductId(sku, wooId) {
+  if (wooId) {
+    try {
+      const byWoo = await pool.query(
+        `SELECT id FROM products WHERE woo_product_id = $1 LIMIT 1`,
+        [wooId]
+      );
+      if (byWoo.rows.length) return byWoo.rows[0].id;
+    } catch (_) {}
+  }
   if (sku) {
     const bySku = await pool.query(
       `SELECT id FROM products WHERE sku = $1 LIMIT 1`,
@@ -236,10 +245,9 @@ async function findExistingProductId(sku, wooId) {
     if (bySku.rows.length) return bySku.rows[0].id;
   }
   if (wooId) {
-    const fallbackSku = `WC-${wooId}`;
     const byWc = await pool.query(
       `SELECT id FROM products WHERE sku = $1 LIMIT 1`,
-      [fallbackSku]
+      [`WC-${wooId}`]
     );
     if (byWc.rows.length) return byWc.rows[0].id;
   }
@@ -363,6 +371,12 @@ async function syncToDatabase(wooProduct) {
         `regular_price = $6`,
       ];
       const vals = [name, category, sellingPrice, description, sku, regularPrice];
+      if (wooId) {
+        try {
+          vals.push(wooId);
+          sets.push(`woo_product_id = $${vals.length}`);
+        } catch (_) {}
+      }
 
       // Always write SEO fields from website (short_description → meta_description)
       vals.push(tagsStr || null);
@@ -412,9 +426,9 @@ async function syncToDatabase(wooProduct) {
         `INSERT INTO products (
            sku, name, category, stock, selling_price, regular_price, cost_price, box_id,
            image_url, images, description, min_stock,
-           tags, meta_description, focus_keyword, weight
+           tags, meta_description, focus_keyword, weight, woo_product_id
          )
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,5,$12,$13,$14,$15)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,5,$12,$13,$14,$15,$16)
          ON CONFLICT (sku) DO UPDATE SET
            name             = EXCLUDED.name,
            category         = EXCLUDED.category,
@@ -433,7 +447,8 @@ async function syncToDatabase(wooProduct) {
            tags             = COALESCE(EXCLUDED.tags, products.tags),
            meta_description = COALESCE(EXCLUDED.meta_description, products.meta_description),
            focus_keyword    = COALESCE(EXCLUDED.focus_keyword, products.focus_keyword),
-           weight           = COALESCE(EXCLUDED.weight, products.weight)
+           weight           = COALESCE(EXCLUDED.weight, products.weight),
+           woo_product_id   = COALESCE(EXCLUDED.woo_product_id, products.woo_product_id)
          RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
         [
           sku,
@@ -451,6 +466,7 @@ async function syncToDatabase(wooProduct) {
           metaDescription || null,
           focusKeyword || null,
           weightVal !== null ? weightVal : 0,
+          wooId,
         ]
       );
       rows = inserted;
@@ -623,32 +639,40 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
     try {
       const wooId = body?.id ? Number(body.id) : null;
       const rawSku = body?.sku && String(body.sku).trim();
-      console.log(`[WooCommerce Webhook] DELETE request id=${wooId} sku=${rawSku}`);
+      console.log(`[WooCommerce Webhook] DELETE request id=${wooId} sku=${rawSku} keys=${Object.keys(body||{}).join(",")}`);
 
       let deletedRows = [];
-      // 1) exact SKU
-      if (rawSku) {
+
+      // 1) by woo_product_id (most reliable when SKU missing)
+      if (wooId) {
+        try {
+          const r0 = await pool.query(
+            `DELETE FROM products WHERE woo_product_id = $1 RETURNING id, sku, woo_product_id`,
+            [wooId]
+          );
+          deletedRows = r0.rows;
+        } catch (colErr) {
+          // column may not exist yet
+          console.warn("[WooCommerce Webhook] woo_product_id delete skip:", colErr.message);
+        }
+      }
+
+      // 2) exact SKU
+      if (!deletedRows.length && rawSku) {
         const r = await pool.query(
           `DELETE FROM products WHERE sku = $1 RETURNING id, sku`,
           [rawSku]
         );
         deletedRows = r.rows;
       }
-      // 2) WC-{id} fallback
+
+      // 3) WC-{id} fallback
       if (!deletedRows.length && wooId) {
         const r2 = await pool.query(
           `DELETE FROM products WHERE sku = $1 OR sku = $2 RETURNING id, sku`,
           [`WC-${wooId}`, String(wooId)]
         );
         deletedRows = r2.rows;
-      }
-      // 3) last resort: products whose sku ends with -{id} or equals id
-      if (!deletedRows.length && wooId) {
-        const r3 = await pool.query(
-          `DELETE FROM products WHERE sku ILIKE $1 RETURNING id, sku`,
-          [`%WC-${wooId}%`]
-        );
-        deletedRows = r3.rows;
       }
 
       console.log(
@@ -663,7 +687,6 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
       });
     } catch (err) {
       console.error("[WooCommerce Webhook] delete failed:", err.message);
-      // still 200 so WC does not disable webhook
       return res.status(200).json({ success: false, error: err.message });
     }
   }
