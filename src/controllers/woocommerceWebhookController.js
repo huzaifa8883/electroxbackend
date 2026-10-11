@@ -129,7 +129,7 @@ function mapWooCategories(wooCategories = []) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// DB sync (THIS WAS MISSING — root cause of the bug)
+// DB sync — update by woo_product_id OR sku (no duplicates)
 // ─────────────────────────────────────────────────────────────
 async function syncToDatabase(wooProduct) {
   const wooId = wooProduct.id ? Number(wooProduct.id) : null;
@@ -189,14 +189,26 @@ async function syncToDatabase(wooProduct) {
              description = $9
            WHERE id = $10
            RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
-          [sku, name, category, stock, sellingPrice, costPrice, imageUrl, images, description, found.rows[0].id]
+          [
+            sku,
+            name,
+            category,
+            stock,
+            sellingPrice,
+            costPrice,
+            imageUrl,
+            images,
+            description,
+            found.rows[0].id,
+          ]
         );
-        console.log(`[WooCommerce Webhook] ✅ UPDATED by woo_id → id=${rows[0].id} sku=${rows[0].sku}`);
+        console.log(
+          `[WooCommerce Webhook] ✅ UPDATED by woo_id → id=${rows[0].id} sku=${rows[0].sku}`
+        );
         return rows[0];
       }
     } catch (e) {
       if (!String(e.message).includes("woo_product_id")) throw e;
-      // column missing — fall through
     }
   }
 
@@ -206,38 +218,69 @@ async function syncToDatabase(wooProduct) {
     [sku]
   );
   if (bySku.rows.length) {
-    const { rows } = await pool.query(
-      `UPDATE products SET
-         name = $1,
-         category = $2,
-         stock = $3,
-         selling_price = $4,
-         cost_price = CASE WHEN $5 > 0 THEN $5 ELSE cost_price END,
-         image_url = COALESCE($6, image_url),
-         images = CASE WHEN $7::text[] IS NOT NULL AND array_length($7::text[], 1) > 0 THEN $7 ELSE images END,
-         description = $8,
-         woo_product_id = COALESCE($9, woo_product_id)
-       WHERE id = $10
-       RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
-      [name, category, stock, sellingPrice, costPrice, imageUrl, images, description, wooId, bySku.rows[0].id]
-    ).catch(async (err) => {
-      // woo_product_id column may not exist
+    let rows;
+    try {
+      const result = await pool.query(
+        `UPDATE products SET
+           name = $1,
+           category = $2,
+           stock = $3,
+           selling_price = $4,
+           cost_price = CASE WHEN $5 > 0 THEN $5 ELSE cost_price END,
+           image_url = COALESCE($6, image_url),
+           images = CASE WHEN $7::text[] IS NOT NULL AND array_length($7::text[], 1) > 0 THEN $7 ELSE images END,
+           description = $8,
+           woo_product_id = COALESCE($9, woo_product_id)
+         WHERE id = $10
+         RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
+        [
+          name,
+          category,
+          stock,
+          sellingPrice,
+          costPrice,
+          imageUrl,
+          images,
+          description,
+          wooId,
+          bySku.rows[0].id,
+        ]
+      );
+      rows = result.rows;
+    } catch (err) {
       if (String(err.message).includes("woo_product_id")) {
-        return pool.query(
+        const result = await pool.query(
           `UPDATE products SET
-             name = $1, category = $2, stock = $3, selling_price = $4,
+             name = $1,
+             category = $2,
+             stock = $3,
+             selling_price = $4,
              cost_price = CASE WHEN $5 > 0 THEN $5 ELSE cost_price END,
              image_url = COALESCE($6, image_url),
              images = CASE WHEN $7::text[] IS NOT NULL AND array_length($7::text[], 1) > 0 THEN $7 ELSE images END,
              description = $8
            WHERE id = $9
            RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
-          [name, category, stock, sellingPrice, costPrice, imageUrl, images, description, bySku.rows[0].id]
+          [
+            name,
+            category,
+            stock,
+            sellingPrice,
+            costPrice,
+            imageUrl,
+            images,
+            description,
+            bySku.rows[0].id,
+          ]
         );
+        rows = result.rows;
+      } else {
+        throw err;
       }
-      throw err;
-    });
-    console.log(`[WooCommerce Webhook] ✅ UPDATED by sku → id=${rows[0].id} sku=${rows[0].sku}`);
+    }
+    console.log(
+      `[WooCommerce Webhook] ✅ UPDATED by sku → id=${rows[0].id} sku=${rows[0].sku}`
+    );
     return rows[0];
   }
 
@@ -250,9 +293,22 @@ async function syncToDatabase(wooProduct) {
        )
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,5,$10)
        RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
-      [sku, name, category, stock, sellingPrice, costPrice, imageUrl, images, description, wooId]
+      [
+        sku,
+        name,
+        category,
+        stock,
+        sellingPrice,
+        costPrice,
+        imageUrl,
+        images,
+        description,
+        wooId,
+      ]
     );
-    console.log(`[WooCommerce Webhook] ✅ CREATED → id=${rows[0].id} sku=${rows[0].sku}`);
+    console.log(
+      `[WooCommerce Webhook] ✅ CREATED → id=${rows[0].id} sku=${rows[0].sku}`
+    );
     return rows[0];
   } catch (err) {
     if (String(err.message).includes("woo_product_id")) {
@@ -263,26 +319,44 @@ async function syncToDatabase(wooProduct) {
          )
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,5)
          RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
-        [sku, name, category, stock, sellingPrice, costPrice, imageUrl, images, description]
+        [
+          sku,
+          name,
+          category,
+          stock,
+          sellingPrice,
+          costPrice,
+          imageUrl,
+          images,
+          description,
+        ]
       );
-      console.log(`[WooCommerce Webhook] ✅ CREATED (no woo_id) → id=${rows[0].id} sku=${rows[0].sku}`);
+      console.log(
+        `[WooCommerce Webhook] ✅ CREATED (no woo_id) → id=${rows[0].id} sku=${rows[0].sku}`
+      );
       return rows[0];
     }
-    // unique sku race → update instead
+    // unique sku race → update
     if (err.code === "23505") {
       const { rows } = await pool.query(
         `UPDATE products SET
-           name = $1, category = $2, stock = $3, selling_price = $4,
-           image_url = COALESCE($5, image_url), description = $6
+           name = $1,
+           category = $2,
+           stock = $3,
+           selling_price = $4,
+           image_url = COALESCE($5, image_url),
+           description = $6
          WHERE sku = $7
          RETURNING id, sku, name, category, stock, selling_price, cost_price, box_id`,
         [name, category, stock, sellingPrice, imageUrl, description, sku]
       );
       return rows[0];
     }
+    console.error("[WooCommerce Webhook] ❌ Database sync failed:", err.message);
     throw err;
   }
 }
+
 // ─────────────────────────────────────────────────────────────
 // Main handler
 // ─────────────────────────────────────────────────────────────
@@ -301,13 +375,15 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
 
   try {
     if (!verifyWooSignature(req)) {
-      console.warn("[WooCommerce Webhook] Invalid signature – continuing anyway");
+      console.warn(
+        "[WooCommerce Webhook] Invalid signature – continuing anyway"
+      );
     }
   } catch (e) {
     console.warn("[WooCommerce Webhook] Signature check error:", e.message);
   }
 
-  // DELETE
+  // DELETE / TRASH
   if (topic.includes("deleted") || topic.includes("trashed")) {
     try {
       const wooId = body.id;
@@ -322,7 +398,10 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
           );
           deletedRows = r.rows;
         } catch (colErr) {
-          console.warn("[WooCommerce Webhook] woo_product_id delete skip:", colErr.message);
+          console.warn(
+            "[WooCommerce Webhook] woo_product_id delete skip:",
+            colErr.message
+          );
         }
       }
       if (!deletedRows.length && rawSku) {
@@ -340,7 +419,9 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
         deletedRows = r2.rows;
       }
 
-      console.log(`[WooCommerce Webhook] 🗑️ deleted count=${deletedRows.length}`);
+      console.log(
+        `[WooCommerce Webhook] 🗑️ deleted count=${deletedRows.length}`
+      );
       return res.status(200).json({
         success: true,
         message: "deleted",
@@ -358,13 +439,22 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
   }
 
   try {
-    // 1) Always sync inventory (create + update)
+    // Always sync inventory (create + update)
     const row = await syncToDatabase(body);
 
-    // 2) Social on create AND update (so website products get FB/IG posts)
-    Promise.allSettled([postToFacebook(body), postToInstagram(body)]).catch(
-      () => {}
-    );
+    // Social ONLY on create — not on update (stops double FB posts)
+    const isCreate =
+      topic === "product.created" || topic === "product.restored";
+
+    if (isCreate) {
+      Promise.allSettled([postToFacebook(body), postToInstagram(body)]).catch(
+        () => {}
+      );
+    } else {
+      console.log(
+        `[WooCommerce Webhook] topic=${topic} → social skipped (update only)`
+      );
+    }
 
     return res.status(200).json({
       success: true,
