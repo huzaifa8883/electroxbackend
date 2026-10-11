@@ -1,4 +1,3 @@
-
 const pool = require("../config/db");
 
 // Optional: inventory → website sync (do not crash app if file missing)
@@ -7,6 +6,12 @@ try {
   syncProductToWoo = require("./wooSync").syncProductToWoo;
 } catch (e) {
   console.warn("[productsController] wooSync.js not loaded — website push disabled:", e.message);
+}
+let postProductToSocial = async () => null;
+try {
+  postProductToSocial = require("./socialPost").postProductToSocial;
+} catch (e) {
+  console.warn("[productsController] socialPost.js not loaded:", e.message);
 }
 
 // POST /api/products/upload-image — multipart/form-data field "image"
@@ -150,12 +155,24 @@ exports.createProduct = async (req, res) => {
 
     // Respond immediately — website sync in background (fast UI, no double-click lag)
     res.status(201).json({ ...product, website_sync: "queued" });
-    setImmediate(() => {
-      syncProductToWoo({ ...product, _allowCreate: true }).then((w) => {
+    setImmediate(async () => {
+      try {
+        const w = await syncProductToWoo({ ...product, _allowCreate: true });
         console.log("[createProduct] website sync OK", product.sku, w?.id);
-      }).catch((e) => {
-        console.error("[createProduct] website sync:", e.message);
-      });
+        // Use website permalink if available for caption link
+        const forSocial = {
+          ...product,
+          permalink: w?.permalink || product.permalink,
+          images: w?.images || product.images,
+          image_url: product.image_url,
+          regular_price: product.regular_price,
+          sale_price: product.selling_price,
+          price: product.selling_price,
+        };
+        await postProductToSocial(forSocial);
+      } catch (e) {
+        console.error("[createProduct] website/social:", e.message);
+      }
     });
   } catch (err) {
     await client.query("ROLLBACK");
