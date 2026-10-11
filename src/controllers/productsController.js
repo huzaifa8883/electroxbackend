@@ -1,3 +1,4 @@
+
 const pool = require("../config/db");
 
 // Optional: inventory → website sync (do not crash app if file missing)
@@ -150,7 +151,7 @@ exports.createProduct = async (req, res) => {
     // Respond immediately — website sync in background (fast UI, no double-click lag)
     res.status(201).json({ ...product, website_sync: "queued" });
     setImmediate(() => {
-      syncProductToWoo(product).then((w) => {
+      syncProductToWoo({ ...product, _allowCreate: true }).then((w) => {
         console.log("[createProduct] website sync OK", product.sku, w?.id);
       }).catch((e) => {
         console.error("[createProduct] website sync:", e.message);
@@ -280,7 +281,8 @@ exports.updateProduct = async (req, res) => {
 
     res.json({ ...product, website_sync: "queued" });
     setImmediate(() => {
-      syncProductToWoo(product).then((w) => {
+      // Updates never create new website products (prevents duplicates on stock change)
+      syncProductToWoo({ ...product, _allowCreate: false }).then((w) => {
         console.log("[updateProduct] website sync OK", product.sku, w?.id);
       }).catch((e) => {
         console.error("[updateProduct] website sync:", e.message);
