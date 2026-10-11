@@ -179,7 +179,7 @@ async function syncProductToWoo(product) {
     regular_price: String(regular),
     sale_price: onSale ? String(sale) : "",
     description: product.description || "",
-    short_description: "",
+    short_description: product.meta_description || "",
     manage_stock: true,
     stock_quantity: Number(product.stock) || 0,
     weight: product.weight != null ? String(product.weight) : "",
