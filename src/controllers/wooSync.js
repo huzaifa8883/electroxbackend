@@ -1,10 +1,5 @@
-
 /**
  * Push inventory product → WooCommerce (create or update by SKU).
- * Requires in .env:
- *   WC_STORE_URL=https://electrox.pk
- *   WC_CONSUMER_KEY=ck_...
- *   WC_CONSUMER_SECRET=cs_...
  */
 const axios = require("axios");
 const pool = require("../config/db");
@@ -13,9 +8,7 @@ function wcClient() {
   const base = (process.env.WC_STORE_URL || "").replace(/\/$/, "");
   const key = process.env.WC_CONSUMER_KEY;
   const secret = process.env.WC_CONSUMER_SECRET;
-  if (!base || !key || !secret) {
-    return null;
-  }
+  if (!base || !key || !secret) return null;
   return axios.create({
     baseURL: `${base}/wp-json/wc/v3`,
     auth: { username: key, password: secret },
@@ -25,7 +18,6 @@ function wcClient() {
 
 async function findCategoryId(client, categoryName) {
   if (!categoryName) return null;
-  // Support "Parent > Child"
   const parts = String(categoryName)
     .split(">")
     .map((s) => s.trim())
@@ -67,106 +59,86 @@ async function findCategoryId(client, categoryName) {
 async function resolveTags(client, tagsStr) {
   if (!tagsStr || !String(tagsStr).trim()) return [];
   const names = String(tagsStr)
-    .split(",")
+    .split(/[,|]/)
     .map((t) => t.trim())
     .filter(Boolean);
   const out = [];
   for (const name of names) {
     try {
       const { data } = await client.get("/products/tags", {
-        params: { search: name, per_page: 20 },
+        params: { search: name, per_page: 50 },
       });
       let tag = (data || []).find((t) => t.name.toLowerCase() === name.toLowerCase());
       if (!tag) {
         const { data: created } = await client.post("/products/tags", { name });
         tag = created;
       }
-      if (tag) out.push({ id: tag.id });
+      if (tag && tag.id) out.push({ id: tag.id });
     } catch (err) {
-      console.warn("[WooSync] tag skip:", name, err.response?.status || err.message);
+      console.error("[WooSync] tag resolve failed:", name, err.response?.data || err.message);
     }
   }
+  console.log("[WooSync] resolved tags:", names, "→", out);
   return out;
 }
 
 async function getBoxNumber(boxId) {
   if (!boxId) return "";
   try {
-    const { rows } = await pool.query(
-      `SELECT box_number FROM boxes WHERE id = $1`,
-      [boxId]
-    );
+    const { rows } = await pool.query(`SELECT box_number FROM boxes WHERE id = $1`, [boxId]);
     return rows[0]?.box_number || "";
   } catch {
     return "";
   }
 }
 
-/**
- * @param {object} product - full product row from inventory
- * @returns {object|null} woo product
- */
 async function syncProductToWoo(product) {
   const client = wcClient();
   if (!client) {
-    console.warn(
-      "[WooSync] WC_STORE_URL / WC_CONSUMER_KEY / WC_CONSUMER_SECRET missing — skip website sync"
-    );
-    return null;
-  }
-  if (product.sync_to_website === false) {
-    console.log("[WooSync] sync_to_website=false — skip", product.sku);
+    console.warn("[WooSync] WC credentials missing – skip");
     return null;
   }
 
+  const publicBase = (process.env.PUBLIC_API_URL || process.env.WEBSITE_URL || "").replace(/\/$/, "");
   const boxNumber = await getBoxNumber(product.box_id);
 
-  const images = [];
-  const imgs = Array.isArray(product.images) ? product.images : [];
-  const cover = product.image_url;
-  const all = cover ? [cover, ...imgs.filter((u) => u !== cover)] : imgs;
-
-  // Base URL for inventory-hosted uploads (must be publicly reachable by WordPress)
-  const publicBase = (
-    process.env.PUBLIC_API_URL ||
-    process.env.INVENTORY_PUBLIC_URL ||
-    "https://electroxbackend.work.gd"
-  ).replace(/\/$/, "");
+  const rawImages = Array.isArray(product.images)
+    ? product.images
+    : product.image_url
+    ? [product.image_url]
+    : [];
+  const all = rawImages.map((x) => (typeof x === "string" ? x : x?.src || x?.url)).filter(Boolean);
 
   function toAbsoluteImageUrl(src) {
-    if (!src) return null;
-    let url = String(src).trim();
+    let url = String(src || "").trim();
     if (!url) return null;
-    // Already absolute
     if (/^https?:\/\//i.test(url)) return url;
-    // Protocol-relative
     if (url.startsWith("//")) return "https:" + url;
-    // Relative path e.g. /uploads/products/xxx.webp
     if (!url.startsWith("/")) url = "/" + url;
-    return publicBase + url;
+    return publicBase ? publicBase + url : null;
   }
 
-  for (const src of all.filter(Boolean).slice(0, 7)) {
+  const images = [];
+  for (const src of all.slice(0, 7)) {
     const url = toAbsoluteImageUrl(src);
     if (url) images.push({ src: url });
   }
-  console.log("[WooSync] images for", product.sku, images.map((i) => i.src));
 
   const categoryId = await findCategoryId(client, product.category);
   const tags = await resolveTags(client, product.tags);
 
   const focus = (product.focus_keyword || "").trim();
   const metaDesc = (product.meta_description || "").trim();
+  const shortDesc = (product.short_description || product.meta_description || "").trim();
+
   const meta_data = [
     { key: "_cost_price", value: String(product.cost_price ?? "0") },
     { key: "cost_price", value: String(product.cost_price ?? "0") },
     { key: "_inventory_box", value: boxNumber || "" },
     { key: "inventory_box", value: boxNumber || "" },
-    // Rank Math SEO
     { key: "rank_math_description", value: metaDesc },
     { key: "rank_math_focus_keyword", value: focus },
     { key: "rank_math_focus_keyword_base", value: focus },
-    // Yoast SEO
     { key: "_yoast_wpseo_metadesc", value: metaDesc },
     { key: "_yoast_wpseo_focuskw", value: focus },
     { key: "_yoast_wpseo_focuskw_text_input", value: focus },
@@ -174,7 +146,6 @@ async function syncProductToWoo(product) {
 
   const regular = Number(product.regular_price) || Number(product.selling_price) || 0;
   const sale = Number(product.selling_price) || 0;
-  // If sale < regular and sale > 0, send both; else only regular
   const onSale = sale > 0 && regular > 0 && sale < regular;
 
   const payload = {
@@ -184,35 +155,36 @@ async function syncProductToWoo(product) {
     regular_price: String(regular),
     sale_price: onSale ? String(sale) : "",
     description: product.description || "",
-    short_description: product.meta_description || "",
+    short_description: shortDesc,
     manage_stock: true,
     stock_quantity: Number(product.stock) || 0,
-    weight: product.weight != null ? String(product.weight) : "",
+    weight: product.weight != null && product.weight !== "" ? String(product.weight) : "",
     status: "publish",
     meta_data,
   };
 
   if (images.length) payload.images = images;
   if (categoryId) payload.categories = [{ id: categoryId }];
-  if (tags.length) payload.tags = tags;
+  // Always send tags array (empty clears only if we want — here send when we have any)
+  if (tags.length) {
+    payload.tags = tags;
+  }
 
-  // allowCreate: false on updates (prevents duplicate products on stock/price edit)
+  console.log("[WooSync] payload tags:", payload.tags, "short_description length:", shortDesc.length);
+
   const allowCreate = product._allowCreate !== false;
 
   try {
     let result = null;
     let existingId = product.woo_product_id ? Number(product.woo_product_id) : null;
 
-    // 1) Prefer woo_product_id — never creates a duplicate
     if (existingId) {
       try {
         const { data } = await client.put(`/products/${existingId}`, payload);
         result = data;
         console.log(`[WooSync] 🔄 Updated by woo_id=${existingId} sku=${product.sku}`);
       } catch (e) {
-        // 404 = product was deleted on website — clear id and fall through
         if (e.response?.status === 404) {
-          console.warn(`[WooSync] woo_id=${existingId} not found on website, will search by SKU`);
           existingId = null;
         } else {
           throw e;
@@ -220,7 +192,6 @@ async function syncProductToWoo(product) {
       }
     }
 
-    // 2) Search by SKU
     if (!result && product.sku) {
       const { data: found } = await client.get("/products", {
         params: { sku: product.sku, per_page: 5 },
@@ -235,12 +206,9 @@ async function syncProductToWoo(product) {
       }
     }
 
-    // 3) Create only when explicitly allowed (new product from inventory)
     if (!result) {
       if (!allowCreate) {
-        console.warn(
-          `[WooSync] No website product found for sku=${product.sku} woo_id=${product.woo_product_id} — skip create (update-only)`
-        );
+        console.warn(`[WooSync] No website product for sku=${product.sku} — skip create`);
         return null;
       }
       const { data } = await client.post("/products", payload);
@@ -248,13 +216,12 @@ async function syncProductToWoo(product) {
       console.log(`[WooSync] ✅ Created website product id=${data.id} sku=${product.sku}`);
     }
 
-    // Save woo product id on inventory row
     if (result?.id && product.id) {
       try {
-        await pool.query(
-          `UPDATE products SET woo_product_id = $1 WHERE id = $2`,
-          [result.id, product.id]
-        );
+        await pool.query(`UPDATE products SET woo_product_id = $1 WHERE id = $2`, [
+          result.id,
+          product.id,
+        ]);
       } catch (e) {
         console.warn("[WooSync] could not save woo_product_id:", e.message);
       }
@@ -263,9 +230,7 @@ async function syncProductToWoo(product) {
   } catch (err) {
     const detail = err.response?.data || err.message;
     console.error("[WooSync] ❌ Failed for sku=", product.sku, detail);
-    throw new Error(
-      typeof detail === "object" ? JSON.stringify(detail) : String(detail)
-    );
+    throw new Error(typeof detail === "object" ? JSON.stringify(detail) : String(detail));
   }
 }
 
