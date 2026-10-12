@@ -386,7 +386,7 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
   try {
     // Fill missing tags/weight/focus from Woo REST API
     const enriched = await enrichFromWooApi(body);
-         const row = await syncToDatabase(enriched);
+            const row = await syncToDatabase(enriched);
 
     const {
       postToFacebook,
@@ -401,37 +401,42 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
       name: enriched.name || row.name,
       permalink: enriched.permalink,
       images: enriched.images,
+      image_url:
+        (Array.isArray(enriched.images) &&
+          enriched.images[0] &&
+          (enriched.images[0].src || enriched.images[0].url)) ||
+        row.image_url,
       selling_price: row.selling_price,
       regular_price: row.regular_price,
       sale_price: enriched.sale_price,
-      price: enriched.price,
+      price: enriched.price || row.selling_price,
       description: enriched.short_description || enriched.description,
     };
 
-    const isCreate =
-      topic === "product.created" || topic === "product.restored";
-    const isUpdate = topic === "product.updated";
-
-    if (isCreate) {
-      if (row.facebook_post_id) {
-        // Inventory ne pehle post kar diya
-        console.log("[Webhook] skip FB create — facebook_post_id already set");
-      } else {
-        Promise.allSettled([
-          postToFacebook(forSocial),
-          postToInstagram(forSocial),
-        ]).catch(() => {});
-        console.log("[Webhook] FB create queued (website-origin product)");
-      }
-    } else if (isUpdate) {
-      if (row.facebook_post_id) {
-        // Sirf caption update — NAYA post nahi
+    // Website product: pehli dafa post (create YA update) agar abhi koi FB post nahi
+    // Inventory product: pehle se facebook_post_id hota hai → yahan skip / sirf update
+    if (row.facebook_post_id) {
+      if (topic === "product.updated") {
         Promise.resolve(updateFacebookPost(forSocial)).catch(() => {});
-        console.log("[Webhook] FB update queued");
+        console.log("[Webhook] FB existing post update queued");
       } else {
-        // Update pe naya post NAHI (user request)
-        console.log("[Webhook] update without facebook_post_id — no new post");
+        console.log("[Webhook] facebook_post_id already set — skip new post");
       }
+    } else if (
+      topic === "product.created" ||
+      topic === "product.restored" ||
+      topic === "product.updated"
+    ) {
+      // Pehli post — website se naya product
+      Promise.allSettled([
+        postToFacebook(forSocial),
+        postToInstagram(forSocial),
+      ]).catch(() => {});
+      console.log(
+        `[Webhook] FB NEW post queued (topic=${topic}, no facebook_post_id yet)`
+      );
+    } else {
+      console.log(`[Webhook] topic=${topic} — social skipped`);
     }
 
     return res.status(200).json({
