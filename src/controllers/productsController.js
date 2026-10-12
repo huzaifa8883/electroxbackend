@@ -398,11 +398,15 @@ exports.deleteProduct = async (req, res) => {
     if (saleCheck[0].cnt > 0) {
       await client.query("ROLLBACK");
       return res.status(409).json({
-        error: "Cannot delete this product because it has sales history. Remove related sales first, or keep the product for records.",
+        error:
+          "Cannot delete this product because it has sales history. Remove related sales first, or keep the product for records.",
       });
     }
 
-    const { rowCount } = await client.query(`DELETE FROM products WHERE id = $1`, [id]);
+    const { rowCount } = await client.query(
+      `DELETE FROM products WHERE id = $1`,
+      [id]
+    );
     if (!rowCount) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Product not found" });
@@ -410,19 +414,60 @@ exports.deleteProduct = async (req, res) => {
 
     await client.query("COMMIT");
 
-    // Also delete from website (best-effort)
+    // Delete from WooCommerce (best-effort, does not fail inventory delete)
     let website_error = null;
     try {
       const { wcClient } = require("./wooSync");
       const clientWoo = wcClient();
-      if (clientWoo && product.sku) {
-        const { data: found } = await clientWoo.get("/products", {
-          params: { sku: product.sku, per_page: 1 },
-        });
-        if (Array.isArray(found) && found.length) {
-          await clientWoo.delete(`/products/${found[0].id}`, { params: { force: true } });
-          console.log("[deleteProduct] deleted from website id=", found[0].id);
+      if (clientWoo) {
+        let wooId = product.woo_product_id ? Number(product.woo_product_id) : null;
+
+        // 1) by woo_product_id
+        if (wooId) {
+          try {
+            await clientWoo.delete(`/products/${wooId}`, {
+              params: { force: true },
+            });
+            console.log("[deleteProduct] website deleted by woo_id=", wooId);
+            wooId = null; // done
+          } catch (e) {
+            if (e.response?.status !== 404) {
+              console.warn(
+                "[deleteProduct] delete by woo_id failed:",
+                e.response?.data || e.message
+              );
+            }
+          }
         }
+
+        // 2) by SKU if still needed
+        if (product.sku) {
+          try {
+            const { data: found } = await clientWoo.get("/products", {
+              params: { sku: product.sku, per_page: 5 },
+            });
+            const matches = Array.isArray(found) ? found : [];
+            for (const p of matches) {
+              if (String(p.sku || "").trim() === String(product.sku).trim()) {
+                await clientWoo.delete(`/products/${p.id}`, {
+                  params: { force: true },
+                });
+                console.log(
+                  "[deleteProduct] website deleted by sku id=",
+                  p.id
+                );
+              }
+            }
+          } catch (e) {
+            website_error = e.response?.data
+              ? JSON.stringify(e.response.data)
+              : e.message;
+            console.error("[deleteProduct] website delete by sku:", website_error);
+          }
+        }
+      } else {
+        website_error = "WC credentials missing";
+        console.warn("[deleteProduct] WC client null — website not deleted");
       }
     } catch (e) {
       website_error = e.message;
@@ -435,7 +480,8 @@ exports.deleteProduct = async (req, res) => {
     console.error(err);
     if (err.code === "23503") {
       return res.status(409).json({
-        error: "Cannot delete this product because it is linked to sales or other records.",
+        error:
+          "Cannot delete this product because it is linked to sales or other records.",
       });
     }
     res.status(500).json({ error: "Failed to delete product" });
