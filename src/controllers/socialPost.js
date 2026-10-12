@@ -182,10 +182,54 @@ async function postProductToSocial(product) {
   };
 }
 
+async function saveFacebookPostId(productId, postId) {
+  if (!productId || !postId) return;
+  try {
+    await pool.query(
+      `UPDATE products SET facebook_post_id = $1 WHERE id = $2`,
+      [String(postId), productId]
+    );
+  } catch (e) {
+    console.warn("[Social] save facebook_post_id:", e.message);
+  }
+}
+
+// postToFacebook ke andar success ke baad:
+// const postId = data.post_id || data.id;
+// if (product.id) await saveFacebookPostId(product.id, postId);
+
+async function updateFacebookPost(product) {
+  const token = process.env.FB_PAGE_ACCESS_TOKEN;
+  const postId = product.facebook_post_id;
+  if (!token || !postId) {
+    console.log("[Social] FB update skipped — no token or facebook_post_id");
+    return null;
+  }
+  const caption = buildCaption(product);
+  try {
+    const { data } = await axios.post(
+      `https://graph.facebook.com/v19.0/${postId}`,
+      { message: caption, access_token: token },
+      { timeout: 30000 }
+    );
+    console.log(`[Social] ✅ Facebook post UPDATED → ${postId}`);
+    return data;
+  } catch (err) {
+    console.error("[Social] ❌ FB update failed:", err.response?.data || err.message);
+    return null;
+  }
+}
+
+async function updateProductOnSocial(product) {
+  return { facebook: await updateFacebookPost(product), instagram: null };
+}
+
 module.exports = {
   buildCaption,
   postToFacebook,
   postToInstagram,
   postProductToSocial,
+  updateFacebookPost,
+  updateProductOnSocial,
   getImageUrl,
 };
