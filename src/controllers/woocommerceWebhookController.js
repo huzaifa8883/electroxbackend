@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const axios = require("axios");
 const pool = require("../config/db");
 const { postToFacebook, postToInstagram } = require("./socialPost");
 
@@ -95,7 +96,7 @@ function getMeta(wooProduct, keys) {
   const list = Array.isArray(wooProduct.meta_data) ? wooProduct.meta_data : [];
   for (const key of keys) {
     const hit = list.find((m) => m && m.key === key);
-    if (hit && hit.value !== undefined && hit.value !== null && String(hit.value).trim() !== "") {
+    if (hit != null && hit.value !== undefined && hit.value !== null && String(hit.value).trim() !== "") {
       return String(hit.value).trim();
     }
   }
@@ -111,9 +112,56 @@ function extractTags(wooProduct) {
     .join(", ");
 }
 
-// ─────────────────────────────────────────────────────────────
-// Website → Inventory upsert (ALL fields)
-// ─────────────────────────────────────────────────────────────
+/** Agar webhook incomplete ho to Woo REST se full product lao */
+async function enrichFromWooApi(body) {
+  const id = body?.id;
+  if (!id) return body;
+
+  const hasTags = Array.isArray(body.tags) && body.tags.length > 0;
+  const hasWeight = body.weight !== undefined && body.weight !== null && String(body.weight).trim() !== "";
+  const hasFocus = !!getMeta(body, [
+    "rank_math_focus_keyword",
+    "rank_math_focus_keyword_base",
+    "_yoast_wpseo_focuskw",
+    "_yoast_wpseo_focuskw_text_input",
+    "focus_keyword",
+  ]);
+
+  // Already complete → no extra API call
+  if (hasTags && hasWeight && hasFocus) return body;
+
+  const base = (process.env.WC_STORE_URL || "").replace(/\/$/, "");
+  const key = process.env.WC_CONSUMER_KEY;
+  const secret = process.env.WC_CONSUMER_SECRET;
+  if (!base || !key || !secret) {
+    console.warn("[WooCommerce Webhook] Cannot enrich — WC API credentials missing");
+    return body;
+  }
+
+  try {
+    const { data } = await axios.get(`${base}/wp-json/wc/v3/products/${id}`, {
+      auth: { username: key, password: secret },
+      timeout: 20000,
+    });
+    console.log(
+      `[WooCommerce Webhook] enriched from API id=${id} tags=${(data.tags || []).length} weight=${data.weight}`
+    );
+    // Webhook body pe API data merge (API wins for missing fields)
+    return {
+      ...body,
+      ...data,
+      // keep webhook images if API empty
+      images:
+        Array.isArray(data.images) && data.images.length
+          ? data.images
+          : body.images,
+    };
+  } catch (err) {
+    console.warn("[WooCommerce Webhook] enrich failed:", err.response?.data || err.message);
+    return body;
+  }
+}
+
 async function syncToDatabase(wooProduct) {
   const wooId = wooProduct.id ? Number(wooProduct.id) : null;
   const rawSku = wooProduct.sku && String(wooProduct.sku).trim();
@@ -124,17 +172,15 @@ async function syncToDatabase(wooProduct) {
   const stock = Number(wooProduct.stock_quantity) || 0;
 
   const regularPrice =
-    Number(wooProduct.regular_price) ||
-    Number(wooProduct.price) ||
-    0;
+    Number(wooProduct.regular_price) || Number(wooProduct.price) || 0;
   const salePrice = Number(wooProduct.sale_price) || 0;
   const sellingPrice = salePrice > 0 ? salePrice : regularPrice;
 
-  let costPrice = Number(getMeta(wooProduct, ["_cost_price", "cost_price", "_wc_cog_cost"])) || 0;
+  const costPrice =
+    Number(getMeta(wooProduct, ["_cost_price", "cost_price", "_wc_cog_cost"])) || 0;
 
   const description = stripHtml(wooProduct.description || "");
   const shortDescription = stripHtml(wooProduct.short_description || "");
-
   const tags = extractTags(wooProduct);
   const focusKeyword = getMeta(wooProduct, [
     "rank_math_focus_keyword",
@@ -158,30 +204,11 @@ async function syncToDatabase(wooProduct) {
   }
   const imageUrl = images[0] || null;
 
-  const fields = {
-    sku,
-    name,
-    category,
-    stock,
-    selling_price: sellingPrice,
-    regular_price: regularPrice,
-    cost_price: costPrice,
-    image_url: imageUrl,
-    images,
-    description,
-    short_description: shortDescription,
-    meta_description: metaDescription,
-    tags,
-    focus_keyword: focusKeyword,
-    weight,
-    woo_product_id: wooId,
-  };
-
-  // 1) by woo_product_id
+  // UPDATE by woo_product_id
   if (wooId) {
     try {
       const found = await pool.query(
-        `SELECT id FROM products WHERE woo_product_id = $1 LIMIT 1`,
+        `SELECT id, facebook_post_id FROM products WHERE woo_product_id = $1 LIMIT 1`,
         [wooId]
       );
       if (found.rows.length) {
@@ -201,29 +228,29 @@ async function syncToDatabase(wooProduct) {
            WHERE id = $16
            RETURNING *`,
           [
-            fields.sku, fields.name, fields.category, fields.stock,
-            fields.selling_price, fields.regular_price, fields.cost_price,
-            fields.image_url, fields.images, fields.description,
-            fields.short_description, fields.meta_description,
-            fields.tags, fields.focus_keyword, fields.weight,
+            sku, name, category, stock,
+            sellingPrice, regularPrice, costPrice,
+            imageUrl, images, description,
+            shortDescription, metaDescription,
+            tags, focusKeyword, weight,
             found.rows[0].id,
           ]
         );
-        console.log(`[WooCommerce Webhook] ✅ UPDATED by woo_id → id=${rows[0].id} sku=${rows[0].sku}`);
+        console.log(
+          `[WooCommerce Webhook] ✅ UPDATED woo_id → id=${rows[0].id} sku=${rows[0].sku} tags="${tags}" weight=${weight} focus="${focusKeyword}"`
+        );
         return rows[0];
       }
     } catch (e) {
-      if (!String(e.message).includes("woo_product_id") && !String(e.message).includes("short_description") && !String(e.message).includes("column")) {
-        // continue to fallbacks for missing columns
-      }
-      if (!String(e.message).includes("woo_product_id")) {
-        console.warn("[WooCommerce Webhook] update by woo_id warn:", e.message);
-      }
+      console.warn("[WooCommerce Webhook] update by woo_id:", e.message);
     }
   }
 
-  // 2) by SKU
-  const bySku = await pool.query(`SELECT id FROM products WHERE sku = $1 LIMIT 1`, [sku]);
+  // UPDATE by SKU
+  const bySku = await pool.query(
+    `SELECT id, facebook_post_id FROM products WHERE sku = $1 LIMIT 1`,
+    [sku]
+  );
   if (bySku.rows.length) {
     try {
       const { rows } = await pool.query(
@@ -243,31 +270,24 @@ async function syncToDatabase(wooProduct) {
          WHERE id = $16
          RETURNING *`,
         [
-          fields.name, fields.category, fields.stock,
-          fields.selling_price, fields.regular_price, fields.cost_price,
-          fields.image_url, fields.images, fields.description,
-          fields.short_description, fields.meta_description,
-          fields.tags, fields.focus_keyword, fields.weight,
-          fields.woo_product_id, bySku.rows[0].id,
+          name, category, stock,
+          sellingPrice, regularPrice, costPrice,
+          imageUrl, images, description,
+          shortDescription, metaDescription,
+          tags, focusKeyword, weight,
+          wooId, bySku.rows[0].id,
         ]
       );
-      console.log(`[WooCommerce Webhook] ✅ UPDATED by sku → id=${rows[0].id} sku=${rows[0].sku}`);
+      console.log(
+        `[WooCommerce Webhook] ✅ UPDATED sku → id=${rows[0].id} tags="${tags}" weight=${weight} focus="${focusKeyword}"`
+      );
       return rows[0];
     } catch (e) {
-      // Minimal update if extra columns missing
-      const { rows } = await pool.query(
-        `UPDATE products SET
-           name = $1, category = $2, stock = $3, selling_price = $4,
-           image_url = COALESCE($5, image_url), description = $6
-         WHERE id = $7 RETURNING *`,
-        [fields.name, fields.category, fields.stock, fields.selling_price, fields.image_url, fields.description, bySku.rows[0].id]
-      );
-      console.warn("[WooCommerce Webhook] partial update (some columns missing):", e.message);
-      return rows[0];
+      console.warn("[WooCommerce Webhook] update by sku:", e.message);
     }
   }
 
-  // 3) INSERT
+  // INSERT
   try {
     const { rows } = await pool.query(
       `INSERT INTO products (
@@ -277,38 +297,29 @@ async function syncToDatabase(wooProduct) {
        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,5,$16)
        RETURNING *`,
       [
-        fields.sku, fields.name, fields.category, fields.stock,
-        fields.selling_price, fields.regular_price, fields.cost_price,
-        fields.image_url, fields.images, fields.description,
-        fields.short_description, fields.meta_description,
-        fields.tags, fields.focus_keyword, fields.weight,
-        fields.woo_product_id,
+        sku, name, category, stock,
+        sellingPrice, regularPrice, costPrice,
+        imageUrl, images, description,
+        shortDescription, metaDescription,
+        tags, focusKeyword, weight, wooId,
       ]
     );
-    console.log(`[WooCommerce Webhook] ✅ CREATED → id=${rows[0].id} sku=${rows[0].sku}`);
+    console.log(
+      `[WooCommerce Webhook] ✅ CREATED id=${rows[0].id} sku=${sku} tags="${tags}" weight=${weight} focus="${focusKeyword}"`
+    );
     return rows[0];
   } catch (err) {
-    // Fallback without optional columns
-    const { rows } = await pool.query(
-      `INSERT INTO products (
-         sku, name, category, stock, selling_price, cost_price,
-         image_url, images, description, min_stock
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,5)
-       RETURNING *`,
-      [
-        fields.sku, fields.name, fields.category, fields.stock,
-        fields.selling_price, fields.cost_price,
-        fields.image_url, fields.images, fields.description,
-      ]
-    );
-    console.warn("[WooCommerce Webhook] created with basic columns only:", err.message);
-    return rows[0];
+    if (err.code === "23505") {
+      const { rows } = await pool.query(
+        `UPDATE products SET name=$1, stock=$2, selling_price=$3 WHERE sku=$4 RETURNING *`,
+        [name, stock, sellingPrice, sku]
+      );
+      return rows[0];
+    }
+    throw err;
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// Handler
-// ─────────────────────────────────────────────────────────────
 exports.handleWooCommerceProductWebhook = async (req, res) => {
   const body = req.body || {};
   const topic = String(
@@ -345,7 +356,10 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
         } catch (_) {}
       }
       if (!deletedRows.length && rawSku) {
-        const r = await pool.query(`DELETE FROM products WHERE sku = $1 RETURNING id, sku`, [rawSku]);
+        const r = await pool.query(
+          `DELETE FROM products WHERE sku = $1 RETURNING id, sku`,
+          [rawSku]
+        );
         deletedRows = r.rows;
       }
       if (!deletedRows.length && wooId) {
@@ -355,7 +369,11 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
         );
         deletedRows = r2.rows;
       }
-      return res.status(200).json({ success: true, message: "deleted", deleted: deletedRows.length });
+      return res.status(200).json({
+        success: true,
+        message: "deleted",
+        deleted: deletedRows.length,
+      });
     } catch (err) {
       return res.status(200).json({ success: false, error: err.message });
     }
@@ -366,28 +384,38 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
   }
 
   try {
-    const row = await syncToDatabase(body);
+    // Fill missing tags/weight/focus from Woo REST API
+    const enriched = await enrichFromWooApi(body);
+    const row = await syncToDatabase(enriched);
 
-    // FB/IG only on create
-    const isCreate = topic === "product.created" || topic === "product.restored";
-    if (isCreate) {
+    // FB/IG:
+    // - always on product.created / restored
+    // - also on product.updated if this product never had a FB post (first publish case)
+    const isCreate =
+      topic === "product.created" || topic === "product.restored";
+    const needsFirstPost =
+      topic === "product.updated" && row && !row.facebook_post_id;
+
+    if (isCreate || needsFirstPost) {
       const forSocial = {
-        ...body,
-        id: row?.id, // inventory id so facebook_post_id can be saved
-        name: body.name || row?.name,
-        permalink: body.permalink,
-        images: body.images,
-        selling_price: row?.selling_price,
-        regular_price: row?.regular_price,
-        sale_price: body.sale_price,
-        price: body.price,
-        description: body.short_description || body.description,
+        ...enriched,
+        id: row.id,
+        name: enriched.name || row.name,
+        permalink: enriched.permalink,
+        images: enriched.images,
+        selling_price: row.selling_price,
+        regular_price: row.regular_price,
+        sale_price: enriched.sale_price,
+        price: enriched.price,
+        description: enriched.short_description || enriched.description,
       };
       Promise.allSettled([
         postToFacebook(forSocial),
         postToInstagram(forSocial),
       ]).catch(() => {});
-      console.log("[WooCommerce Webhook] social posts queued for create");
+      console.log(
+        `[WooCommerce Webhook] social queued (create=${isCreate} firstPost=${!!needsFirstPost})`
+      );
     } else {
       console.log(`[WooCommerce Webhook] topic=${topic} → social skipped`);
     }
@@ -395,18 +423,16 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: "synced",
-      product: row
-        ? {
-            id: row.id,
-            sku: row.sku,
-            tags: row.tags,
-            focus_keyword: row.focus_keyword,
-            short_description: row.short_description,
-            weight: row.weight,
-            regular_price: row.regular_price,
-            selling_price: row.selling_price,
-          }
-        : null,
+      product: {
+        id: row.id,
+        sku: row.sku,
+        tags: row.tags,
+        focus_keyword: row.focus_keyword,
+        short_description: row.short_description,
+        weight: row.weight,
+        regular_price: row.regular_price,
+        selling_price: row.selling_price,
+      },
     });
   } catch (err) {
     console.error("[WooCommerce Webhook] Sync error:", err);
@@ -415,5 +441,9 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
 };
 
 exports.webhookPing = async (req, res) => {
-  res.status(200).json({ ok: true, service: "electrox-inventory", time: new Date().toISOString() });
+  res.status(200).json({
+    ok: true,
+    service: "electrox-inventory",
+    time: new Date().toISOString(),
+  });
 };
