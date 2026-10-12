@@ -7,9 +7,13 @@ try {
 } catch (e) {
   console.warn("[productsController] wooSync.js not loaded — website push disabled:", e.message);
 }
+
 let postProductToSocial = async () => null;
+let updateProductOnSocial = async () => null;
 try {
-  postProductToSocial = require("./socialPost").postProductToSocial;
+  const social = require("./socialPost");
+  postProductToSocial = social.postProductToSocial;
+  updateProductOnSocial = social.updateProductOnSocial || (async () => null);
 } catch (e) {
   console.warn("[productsController] socialPost.js not loaded:", e.message);
 }
@@ -29,7 +33,9 @@ exports.getProducts = async (req, res) => {
 
     if (search) {
       values.push(`%${search}%`);
-      clauses.push(`(p.name ILIKE $${values.length} OR p.sku ILIKE $${values.length} OR p.category ILIKE $${values.length} OR b.box_number ILIKE $${values.length})`);
+      clauses.push(
+        `(p.name ILIKE $${values.length} OR p.sku ILIKE $${values.length} OR p.category ILIKE $${values.length} OR b.box_number ILIKE $${values.length})`
+      );
     }
     if (category) {
       values.push(category);
@@ -79,7 +85,6 @@ exports.getProductById = async (req, res) => {
   }
 };
 
-// Normalize images array from body (string JSON or array)
 function normalizeImages(images, image_url) {
   let imgs = [];
   if (Array.isArray(images)) {
@@ -92,21 +97,32 @@ function normalizeImages(images, image_url) {
       imgs = images.split(",").map((s) => s.trim()).filter(Boolean);
     }
   }
-  // Ensure primary image_url is first in gallery if present
   if (image_url && !imgs.includes(image_url)) {
     imgs = [image_url, ...imgs];
   }
-  // Cap at 7
   return imgs.slice(0, 7);
 }
 
 // POST /api/products
 exports.createProduct = async (req, res) => {
   const {
-    sku, name, category, stock = 0, min_stock = 5,
-    cost_price = 0, selling_price = 0, regular_price = 0, supplier_id, box_id,
-    image_url, description, images,
-    meta_description, tags, focus_keyword, weight,
+    sku,
+    name,
+    category,
+    stock = 0,
+    min_stock = 5,
+    cost_price = 0,
+    selling_price = 0,
+    regular_price = 0,
+    supplier_id,
+    box_id,
+    image_url,
+    description,
+    images,
+    meta_description,
+    tags,
+    focus_keyword,
+    weight,
     sync_to_website = true,
   } = req.body;
 
@@ -131,13 +147,23 @@ exports.createProduct = async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
        RETURNING *`,
       [
-        sku, name, category || null,
-        Number(stock) || 0, Number(min_stock) || 5,
-        Number(cost_price) || 0, sale, reg,
-        supplier_id || null, box_id || null,
-        cover, imgs, description || null,
-        meta_description || null, tags || null,
-        focus_keyword || null, Number(weight) || 0,
+        sku,
+        name,
+        category || null,
+        Number(stock) || 0,
+        Number(min_stock) || 5,
+        Number(cost_price) || 0,
+        sale,
+        reg,
+        supplier_id || null,
+        box_id || null,
+        cover,
+        imgs,
+        description || null,
+        meta_description || null,
+        tags || null,
+        focus_keyword || null,
+        Number(weight) || 0,
         sync_to_website === false || sync_to_website === "false" ? false : true,
       ]
     );
@@ -153,13 +179,14 @@ exports.createProduct = async (req, res) => {
 
     await client.query("COMMIT");
 
-    // Respond immediately — website sync in background (fast UI, no double-click lag)
     res.status(201).json({ ...product, website_sync: "queued" });
+
+    // Background: website + ONE Facebook post (webhook will skip if facebook_post_id saved)
     setImmediate(async () => {
       try {
         const w = await syncProductToWoo({ ...product, _allowCreate: true });
         console.log("[createProduct] website sync OK", product.sku, w?.id);
-        // Use website permalink if available for caption link
+
         const forSocial = {
           ...product,
           permalink: w?.permalink || product.permalink,
@@ -178,6 +205,7 @@ exports.createProduct = async (req, res) => {
     await client.query("ROLLBACK");
     console.error(err);
     if (err.code === "23505") return res.status(409).json({ error: "SKU already exists" });
+
     if (err.message && err.message.includes("column")) {
       console.error("[createProduct] column missing, retrying without website fields:", err.message);
       try {
@@ -190,21 +218,37 @@ exports.createProduct = async (req, res) => {
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
            RETURNING *`,
           [
-            req.body.sku, req.body.name, req.body.category || null,
-            Number(req.body.stock) || 0, Number(req.body.min_stock) || 5,
-            Number(req.body.cost_price) || 0, Number(req.body.selling_price) || 0,
-            req.body.supplier_id || null, req.body.box_id || null,
-            cover2, imgs2, req.body.description || null, req.body.characteristics || null, req.body.location || null,
+            req.body.sku,
+            req.body.name,
+            req.body.category || null,
+            Number(req.body.stock) || 0,
+            Number(req.body.min_stock) || 5,
+            Number(req.body.cost_price) || 0,
+            Number(req.body.selling_price) || 0,
+            req.body.supplier_id || null,
+            req.body.box_id || null,
+            cover2,
+            imgs2,
+            req.body.description || null,
+            req.body.characteristics || null,
+            req.body.location || null,
           ]
         );
         const product2 = rows2[0];
-        let website = null, website_error = "Run migrate_website_fields.sql to enable SEO fields + full website sync meta";
-        try { website = await syncProductToWoo({ ...product2, ...req.body }); } catch (e) { website_error = e.message; }
+        let website = null;
+        let website_error =
+          "Run migrate_website_fields.sql to enable SEO fields + full website sync meta";
+        try {
+          website = await syncProductToWoo({ ...product2, ...req.body });
+        } catch (e) {
+          website_error = e.message;
+        }
         return res.status(201).json({ ...product2, website, website_error });
       } catch (err2) {
         console.error(err2);
         return res.status(500).json({
-          error: "Database missing website fields. Run as postgres: psql -U postgres -d electrox_pro -f migrate_website_fields.sql",
+          error:
+            "Database missing website fields. Run as postgres: psql -U postgres -d electrox_pro -f migrate_website_fields.sql",
           detail: err.message,
         });
       }
@@ -221,9 +265,20 @@ exports.updateProduct = async (req, res) => {
   const body = req.body || {};
 
   const fields = [
-    "sku", "name", "category", "min_stock", "cost_price", "selling_price", "regular_price",
-    "supplier_id", "box_id", "description",
-    "meta_description", "tags", "focus_keyword", "weight",
+    "sku",
+    "name",
+    "category",
+    "min_stock",
+    "cost_price",
+    "selling_price",
+    "regular_price",
+    "supplier_id",
+    "box_id",
+    "description",
+    "meta_description",
+    "tags",
+    "focus_keyword",
+    "weight",
     "sync_to_website",
   ];
 
@@ -247,7 +302,11 @@ exports.updateProduct = async (req, res) => {
     fields.forEach((f) => {
       if (body[f] !== undefined) {
         let val = body[f];
-        if (["min_stock", "cost_price", "selling_price", "regular_price", "weight"].includes(f)) val = Number(val) || 0;
+        if (
+          ["min_stock", "cost_price", "selling_price", "regular_price", "weight"].includes(f)
+        ) {
+          val = Number(val) || 0;
+        }
         if (["supplier_id", "box_id"].includes(f) && (val === "" || val === null)) val = null;
         if (f === "sync_to_website") val = val === false || val === "false" ? false : true;
         values.push(val);
@@ -297,13 +356,29 @@ exports.updateProduct = async (req, res) => {
     const product = rows[0];
 
     res.json({ ...product, website_sync: "queued" });
-    setImmediate(() => {
-      // Updates never create new website products (prevents duplicates on stock change)
-      syncProductToWoo({ ...product, _allowCreate: false }).then((w) => {
+
+    // Background: website update + Facebook EXISTING post update (no new post)
+    setImmediate(async () => {
+      try {
+        const w = await syncProductToWoo({ ...product, _allowCreate: false });
         console.log("[updateProduct] website sync OK", product.sku, w?.id);
-      }).catch((e) => {
-        console.error("[updateProduct] website sync:", e.message);
-      });
+
+        const { rows: fresh } = await pool.query(
+          `SELECT * FROM products WHERE id = $1`,
+          [product.id]
+        );
+        const p = fresh[0] || product;
+
+        await updateProductOnSocial({
+          ...p,
+          permalink: w?.permalink || p.permalink,
+          images: w?.images || p.images,
+          sale_price: p.selling_price,
+          regular_price: p.regular_price || p.selling_price,
+        });
+      } catch (e) {
+        console.error("[updateProduct] website/social:", e.message);
+      }
     });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -336,11 +411,13 @@ exports.assignBox = async (req, res) => {
 exports.adjustStock = async (req, res) => {
   const { id } = req.params;
   const { quantity_changed, type = "adjustment", reference = "" } = req.body;
-
-  if (quantity_changed === undefined || quantity_changed === null || isNaN(Number(quantity_changed))) {
+  if (
+    quantity_changed === undefined ||
+    quantity_changed === null ||
+    isNaN(Number(quantity_changed))
+  ) {
     return res.status(400).json({ error: "quantity_changed (number) is required" });
   }
-
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -357,13 +434,11 @@ exports.adjustStock = async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ error: "Insufficient stock" });
     }
-
     await client.query(
       `INSERT INTO stock_ledger (product_id, type, quantity_changed, balance_after, reference)
        VALUES ($1,$2,$3,$4,$5)`,
       [id, type, Number(quantity_changed), product.stock, reference]
     );
-
     await client.query("COMMIT");
     res.json(product);
   } catch (err) {
@@ -403,10 +478,7 @@ exports.deleteProduct = async (req, res) => {
       });
     }
 
-    const { rowCount } = await client.query(
-      `DELETE FROM products WHERE id = $1`,
-      [id]
-    );
+    const { rowCount } = await client.query(`DELETE FROM products WHERE id = $1`, [id]);
     if (!rowCount) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Product not found" });
@@ -414,7 +486,6 @@ exports.deleteProduct = async (req, res) => {
 
     await client.query("COMMIT");
 
-    // Delete from WooCommerce (best-effort, does not fail inventory delete)
     let website_error = null;
     try {
       const { wcClient } = require("./wooSync");
@@ -422,14 +493,11 @@ exports.deleteProduct = async (req, res) => {
       if (clientWoo) {
         let wooId = product.woo_product_id ? Number(product.woo_product_id) : null;
 
-        // 1) by woo_product_id
         if (wooId) {
           try {
-            await clientWoo.delete(`/products/${wooId}`, {
-              params: { force: true },
-            });
+            await clientWoo.delete(`/products/${wooId}`, { params: { force: true } });
             console.log("[deleteProduct] website deleted by woo_id=", wooId);
-            wooId = null; // done
+            wooId = null;
           } catch (e) {
             if (e.response?.status !== 404) {
               console.warn(
@@ -440,7 +508,6 @@ exports.deleteProduct = async (req, res) => {
           }
         }
 
-        // 2) by SKU if still needed
         if (product.sku) {
           try {
             const { data: found } = await clientWoo.get("/products", {
@@ -449,13 +516,8 @@ exports.deleteProduct = async (req, res) => {
             const matches = Array.isArray(found) ? found : [];
             for (const p of matches) {
               if (String(p.sku || "").trim() === String(product.sku).trim()) {
-                await clientWoo.delete(`/products/${p.id}`, {
-                  params: { force: true },
-                });
-                console.log(
-                  "[deleteProduct] website deleted by sku id=",
-                  p.id
-                );
+                await clientWoo.delete(`/products/${p.id}`, { params: { force: true } });
+                console.log("[deleteProduct] website deleted by sku id=", p.id);
               }
             }
           } catch (e) {
