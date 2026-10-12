@@ -386,18 +386,18 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
   try {
     // Fill missing tags/weight/focus from Woo REST API
     const enriched = await enrichFromWooApi(body);
-      const row = await syncToDatabase(enriched);
+         const row = await syncToDatabase(enriched);
 
-    const { updateFacebookPost, postToFacebook, postToInstagram } = require("./socialPost");
-
-    const isCreate =
-      topic === "product.created" || topic === "product.restored";
-    const isUpdate = topic === "product.updated";
+    const {
+      postToFacebook,
+      postToInstagram,
+      updateFacebookPost,
+    } = require("./socialPost");
 
     const forSocial = {
       ...enriched,
       id: row.id,
-      facebook_post_id: row.facebook_post_id,
+      facebook_post_id: row.facebook_post_id || null,
       name: enriched.name || row.name,
       permalink: enriched.permalink,
       images: enriched.images,
@@ -408,32 +408,30 @@ exports.handleWooCommerceProductWebhook = async (req, res) => {
       description: enriched.short_description || enriched.description,
     };
 
+    const isCreate =
+      topic === "product.created" || topic === "product.restored";
+    const isUpdate = topic === "product.updated";
+
     if (isCreate) {
-      // Inventory se pehle se post ho chuki ho to skip — DOUBLE POST band
       if (row.facebook_post_id) {
-        console.log("[WooCommerce Webhook] FB already exists — skip create post");
+        // Inventory ne pehle post kar diya
+        console.log("[Webhook] skip FB create — facebook_post_id already set");
       } else {
         Promise.allSettled([
           postToFacebook(forSocial),
           postToInstagram(forSocial),
         ]).catch(() => {});
-        console.log("[WooCommerce Webhook] social queued (new product)");
+        console.log("[Webhook] FB create queued (website-origin product)");
       }
     } else if (isUpdate) {
-      // Sirf existing post update — naya post nahi
       if (row.facebook_post_id) {
+        // Sirf caption update — NAYA post nahi
         Promise.resolve(updateFacebookPost(forSocial)).catch(() => {});
-        console.log("[WooCommerce Webhook] FB post update queued");
+        console.log("[Webhook] FB update queued");
       } else {
-        // Pehli dafa website-only product publish hua, kabhi post nahi bani
-        Promise.allSettled([
-          postToFacebook(forSocial),
-          postToInstagram(forSocial),
-        ]).catch(() => {});
-        console.log("[WooCommerce Webhook] first FB post on update (no prior post_id)");
+        // Update pe naya post NAHI (user request)
+        console.log("[Webhook] update without facebook_post_id — no new post");
       }
-    } else {
-      console.log(`[WooCommerce Webhook] topic=${topic} → social skipped`);
     }
 
     return res.status(200).json({
