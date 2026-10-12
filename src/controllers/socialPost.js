@@ -13,25 +13,49 @@ function stripHtml(html = "") {
     .replace(/\s+/g, " ")
     .trim();
 }
-
 function formatPrice(product) {
-  const sale =
+  const saleRaw =
     product.sale_price !== undefined &&
     product.sale_price !== null &&
     String(product.sale_price).trim() !== ""
       ? Number(product.sale_price)
       : null;
+
   const regular =
     Number(product.regular_price) ||
     Number(product.selling_price) ||
     Number(product.price) ||
     0;
-  const active = sale && sale > 0 ? sale : regular;
-  if (!active) return "Price on request";
-  if (sale && sale > 0 && regular > sale) {
-    return `~~Rs. ${regular.toLocaleString()}~~  →  🔥 Rs. ${sale.toLocaleString()}`;
+
+  // Inventory: selling_price often = sale; regular_price = original
+  let sale = saleRaw;
+  if ((sale === null || sale === 0) && Number(product.selling_price) > 0) {
+    const sp = Number(product.selling_price);
+    if (regular > 0 && sp < regular) sale = sp;
   }
-  return `Rs. ${Number(active).toLocaleString()}`;
+
+  if (!regular && !sale) return null;
+
+  const fmt = (n) => `Rs. ${Number(n).toLocaleString("en-PK")}`;
+
+  // Sale chal rahi ho
+  if (sale > 0 && regular > 0 && sale < regular) {
+    const off = Math.round(((regular - sale) / regular) * 100);
+    return {
+      hasSale: true,
+      regular: fmt(regular),
+      sale: fmt(sale),
+      off,
+    };
+  }
+
+  const active = sale > 0 ? sale : regular;
+  return {
+    hasSale: false,
+    regular: fmt(active),
+    sale: null,
+    off: 0,
+  };
 }
 
 function toAbsolute(src) {
@@ -60,24 +84,51 @@ function getImageUrl(product) {
 
 function buildCaption(product) {
   const title = (product.name || "New Arrival").trim();
-  const priceLine = formatPrice(product);
+  const price = formatPrice(product);
   const short = stripHtml(
     product.short_description ||
       product.meta_description ||
       product.description ||
       ""
   )
-    .slice(0, 220)
+    .slice(0, 200)
     .trim();
   const link = product.permalink || process.env.WEBSITE_URL || "";
 
-  let caption = `🔥 ${title}\n\n💰 ${priceLine}\n\n`;
-  if (short) caption += `📝 ${short}\n\n`;
-  if (link) caption += `🛒 Order now: ${link}\n\n`;
-  caption += `#Electrox #Electronics #NewArrival`;
+  // ─── Title ───
+  let caption = `✨ ${title}\n`;
+  caption += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+  // ─── Price block ───
+  if (price) {
+    if (price.hasSale) {
+      caption += `💥 SPECIAL OFFER\n`;
+      caption += `~~${price.regular}~~  ❌\n`;
+      caption += `🔥 Now only ${price.sale}\n`;
+      caption += `✅ ${price.off}% OFF — Limited time!\n\n`;
+    } else {
+      caption += `💰 Price: ${price.regular}\n\n`;
+    }
+  } else {
+    caption += `💰 Price on request\n\n`;
+  }
+
+  // ─── Short description ───
+  if (short) {
+    caption += `📝 ${short}\n\n`;
+  }
+
+  // ─── CTA + link ───
+  if (link) {
+    caption += `🛒 Order now:\n${link}\n\n`;
+  }
+
+  caption += `━━━━━━━━━━━━━━━━━━━━\n`;
+  caption += `📦 Fast delivery  |  ✅ Genuine product\n`;
+  caption += `#Electrox #Electronics #NewArrival #Sale`;
+
   return caption;
 }
-
 async function saveFacebookPostId(productId, postId) {
   if (!productId || !postId) return;
   try {
