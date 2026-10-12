@@ -182,21 +182,22 @@ exports.createProduct = async (req, res) => {
     res.status(201).json({ ...product, website_sync: "queued" });
 
     // Background: website + ONE Facebook post (webhook will skip if facebook_post_id saved)
-    setImmediate(async () => {
+        setImmediate(async () => {
       try {
-        const w = await syncProductToWoo({ ...product, _allowCreate: true });
-        console.log("[createProduct] website sync OK", product.sku, w?.id);
-
+        // 1) PEHLE Facebook post + facebook_post_id SAVE
         const forSocial = {
           ...product,
-          permalink: w?.permalink || product.permalink,
-          images: w?.images || product.images,
+          images: product.images,
           image_url: product.image_url,
           regular_price: product.regular_price,
           sale_price: product.selling_price,
           price: product.selling_price,
         };
         await postProductToSocial(forSocial);
+
+        // 2) PHIR website (webhook aayega lekin facebook_post_id pehle se hoga → skip)
+        const w = await syncProductToWoo({ ...product, _allowCreate: true });
+        console.log("[createProduct] website sync OK", product.sku, w?.id);
       } catch (e) {
         console.error("[createProduct] website/social:", e.message);
       }
