@@ -84,16 +84,63 @@ exports.checkout = async (req, res) => {
   }
 };
 
-// GET /api/pos/sales — recent sales list
+// GET /api/pos/sales — sales list with filters
+// Query params: period=today|week|month|all, customer=string, product=string, category=string, limit=number
 exports.getSales = async (req, res) => {
   try {
-    const { rows } = await pool.query(`
+    const { period = "all", customer, product, category, limit = 200 } = req.query;
+    const params = [];
+    let where = ["1=1"];
+    let paramIdx = 1;
+
+    if (period === "today") {
+      where.push(`s.date >= CURRENT_DATE AND s.date < CURRENT_DATE + INTERVAL '1 day'`);
+    } else if (period === "week") {
+      where.push(`s.date >= date_trunc('week', CURRENT_DATE)`);
+    } else if (period === "month") {
+      where.push(`s.date >= date_trunc('month', CURRENT_DATE)`);
+    }
+
+    if (customer && customer.trim()) {
+      where.push(`c.name ILIKE $${paramIdx}`);
+      params.push(`%${customer.trim()}%`);
+      paramIdx++;
+    }
+
+    // Filter by product name/sku or category via existence of matching sale_items
+    if ((product && product.trim()) || (category && category.trim())) {
+      const subConditions = [];
+      if (product && product.trim()) {
+        subConditions.push(`(p.name ILIKE $${paramIdx} OR p.sku ILIKE $${paramIdx})`);
+        params.push(`%${product.trim()}%`);
+        paramIdx++;
+      }
+      if (category && category.trim()) {
+        subConditions.push(`p.category ILIKE $${paramIdx}`);
+        params.push(`%${category.trim()}%`);
+        paramIdx++;
+      }
+      where.push(`EXISTS (
+        SELECT 1 FROM sale_items si
+        JOIN products p ON p.id = si.product_id
+        WHERE si.sale_id = s.id AND ${subConditions.join(" AND ")}
+      )`);
+    }
+
+    const limitVal = Math.min(parseInt(limit, 10) || 200, 500);
+    params.push(limitVal);
+
+    const { rows } = await pool.query(
+      `
       SELECT s.*, c.name AS customer_name
       FROM sales s
       LEFT JOIN customers c ON c.id = s.customer_id
+      WHERE ${where.join(" AND ")}
       ORDER BY s.date DESC
-      LIMIT 100
-    `);
+      LIMIT $${paramIdx}
+      `,
+      params
+    );
     res.json(rows);
   } catch (err) {
     console.error(err);
@@ -104,11 +151,17 @@ exports.getSales = async (req, res) => {
 // GET /api/pos/sales/:id — invoice detail with line items
 exports.getSaleById = async (req, res) => {
   try {
-    const saleRes = await pool.query(`SELECT * FROM sales WHERE id = $1`, [req.params.id]);
+    const saleRes = await pool.query(
+      `SELECT s.*, c.name AS customer_name
+       FROM sales s
+       LEFT JOIN customers c ON c.id = s.customer_id
+       WHERE s.id = $1`,
+      [req.params.id]
+    );
     if (!saleRes.rows.length) return res.status(404).json({ error: "Sale not found" });
 
     const itemsRes = await pool.query(
-      `SELECT si.*, p.name, p.sku FROM sale_items si
+      `SELECT si.*, p.name, p.sku, p.category FROM sale_items si
        JOIN products p ON p.id = si.product_id
        WHERE si.sale_id = $1`,
       [req.params.id]
