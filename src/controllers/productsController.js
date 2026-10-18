@@ -401,7 +401,16 @@ exports.assignBox = async (req, res) => {
       [box_id || null, id]
     );
     if (!rows.length) return res.status(404).json({ error: "Product not found" });
-    res.json(rows[0]);
+    const product = rows[0];
+    // Push updated box meta to WooCommerce when product is synced
+    if (product.sync_to_website !== false && product.woo_product_id) {
+      try {
+        await syncProductToWoo(product);
+      } catch (e) {
+        console.warn("[assignBox] Woo sync failed:", e.message);
+      }
+    }
+    res.json(product);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to assign box" });
