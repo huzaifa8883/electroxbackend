@@ -50,6 +50,8 @@ function mapWooCategories(wooCategories = []) {
     "power cables": "Power Cables", "power cable": "Power Cables",
     "mobile cables": "Mobile Cables", "mobile cable": "Mobile Cables",
     "display cables": "Display Cables", "display cable": "Display Cables",
+    "network cables": "Network Cables", "network cable": "Network Cables",
+    "usb cables": "USB Cables", "usb cable": "USB Cables",
     connectors: "Connectors", connector: "Connectors",
     others: "Others", other: "Others",
   };
@@ -162,6 +164,23 @@ async function enrichFromWooApi(body) {
   }
 }
 
+
+/** Resolve inventory_box meta → boxes.id (only existing inventory boxes; no auto-create) */
+async function resolveBoxIdFromMeta(wooProduct) {
+  const boxNumber = getMeta(wooProduct, ["inventory_box", "_inventory_box"]);
+  if (!boxNumber) return null;
+  try {
+    const { rows } = await pool.query(
+      `SELECT id FROM boxes WHERE LOWER(TRIM(box_number)) = LOWER(TRIM($1)) LIMIT 1`,
+      [boxNumber]
+    );
+    return rows[0]?.id || null;
+  } catch (e) {
+    console.warn("[WooCommerce Webhook] resolveBoxId:", e.message);
+    return null;
+  }
+}
+
 async function syncToDatabase(wooProduct) {
   const wooId = wooProduct.id ? Number(wooProduct.id) : null;
   const rawSku = wooProduct.sku && String(wooProduct.sku).trim();
@@ -197,6 +216,7 @@ async function syncToDatabase(wooProduct) {
     ]) || shortDescription.slice(0, 160);
 
   const weight = Number(wooProduct.weight) || 0;
+  const boxId = await resolveBoxIdFromMeta(wooProduct);
 
   let images = [];
   if (Array.isArray(wooProduct.images) && wooProduct.images.length > 0) {
@@ -224,8 +244,9 @@ async function syncToDatabase(wooProduct) {
              meta_description = $12,
              tags = $13,
              focus_keyword = $14,
-             weight = $15
-           WHERE id = $16
+             weight = $15,
+             box_id = $16
+           WHERE id = $17
            RETURNING *`,
           [
             sku, name, category, stock,
@@ -233,6 +254,7 @@ async function syncToDatabase(wooProduct) {
             imageUrl, images, description,
             shortDescription, metaDescription,
             tags, focusKeyword, weight,
+            boxId,
             found.rows[0].id,
           ]
         );
@@ -266,8 +288,9 @@ async function syncToDatabase(wooProduct) {
            tags = $12,
            focus_keyword = $13,
            weight = $14,
-           woo_product_id = COALESCE($15, woo_product_id)
-         WHERE id = $16
+           woo_product_id = COALESCE($15, woo_product_id),
+           box_id = $16
+         WHERE id = $17
          RETURNING *`,
         [
           name, category, stock,
@@ -275,7 +298,7 @@ async function syncToDatabase(wooProduct) {
           imageUrl, images, description,
           shortDescription, metaDescription,
           tags, focusKeyword, weight,
-          wooId, bySku.rows[0].id,
+          wooId, boxId, bySku.rows[0].id,
         ]
       );
       console.log(
@@ -293,15 +316,15 @@ async function syncToDatabase(wooProduct) {
       `INSERT INTO products (
          sku, name, category, stock, selling_price, regular_price, cost_price,
          image_url, images, description, short_description, meta_description,
-         tags, focus_keyword, weight, min_stock, woo_product_id
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,5,$16)
+         tags, focus_keyword, weight, min_stock, woo_product_id, box_id
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,5,$16,$17)
        RETURNING *`,
       [
         sku, name, category, stock,
         sellingPrice, regularPrice, costPrice,
         imageUrl, images, description,
         shortDescription, metaDescription,
-        tags, focusKeyword, weight, wooId,
+        tags, focusKeyword, weight, wooId, boxId,
       ]
     );
     console.log(
