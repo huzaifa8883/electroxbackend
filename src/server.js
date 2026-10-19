@@ -22,6 +22,21 @@ app.use("/uploads", express.static(path.join(__dirname, "..", "uploads")));
 app.use("/webhooks", webhooksRoutes);
 app.get("/api/health", (req, res) => res.json({ status: "ok" }));
 
+// Public boxes list (for website All Boxes page) — read only
+const boxesCtrl = require("./controllers/boxesController");
+app.get("/api/public/boxes", boxesCtrl.getBoxes);
+app.get("/api/public/boxes/:id", boxesCtrl.getBoxById);
+
+// Public box delete — requires header X-Electrox-Key matching WOOCOMMERCE_WEBHOOK_SECRET or BOXES_API_KEY
+app.delete("/api/public/boxes/:id", async (req, res) => {
+  const key = req.headers["x-electrox-key"] || req.query.key || "";
+  const secret = process.env.BOXES_API_KEY || process.env.WOOCOMMERCE_WEBHOOK_SECRET || "";
+  if (!secret || key !== secret) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  return boxesCtrl.deleteBox(req, res);
+});
+
 // ========== AUTH + PROTECTED ROUTES ==========
 app.use("/api", authRoutes);
 app.use("/api/products", productsRoutes);
