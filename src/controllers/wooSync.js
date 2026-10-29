@@ -1,19 +1,52 @@
+
 /**
- * Push inventory product → WooCommerce (create or update by SKU).
+ * Push inventory product → WooCommerce (Electrox + optional VoltBank).
  */
 const axios = require("axios");
 const pool = require("../config/db");
 
-function wcClient() {
-  const base = (process.env.WC_STORE_URL || "").replace(/\/$/, "");
-  const key = process.env.WC_CONSUMER_KEY;
-  const secret = process.env.WC_CONSUMER_SECRET;
+const VOLTBANK_CAT_KEYWORDS = [
+  "solar",
+  "batter",
+  "charger",
+  "power supply",
+  "power-supply",
+  "power supplies",
+  "cable",
+];
+
+function isVoltBankCategory(category) {
+  if (!category) return false;
+  const n = String(category).toLowerCase();
+  return VOLTBANK_CAT_KEYWORDS.some((k) => n.includes(k));
+}
+
+function makeWcClient(base, key, secret) {
+  base = (base || "").replace(/\/$/, "");
   if (!base || !key || !secret) return null;
   return axios.create({
     baseURL: `${base}/wp-json/wc/v3`,
     auth: { username: key, password: secret },
     timeout: 30000,
   });
+}
+
+/** Primary store (Electrox) */
+function wcClient() {
+  return makeWcClient(
+    process.env.WC_STORE_URL,
+    process.env.WC_CONSUMER_KEY,
+    process.env.WC_CONSUMER_SECRET
+  );
+}
+
+/** Secondary store (VoltBank) */
+function vbClient() {
+  return makeWcClient(
+    process.env.VB_STORE_URL || process.env.VOLTBANK_STORE_URL,
+    process.env.VB_CONSUMER_KEY || process.env.VOLTBANK_CONSUMER_KEY,
+    process.env.VB_CONSUMER_SECRET || process.env.VOLTBANK_CONSUMER_SECRET
+  );
 }
 
 async function findCategoryId(client, categoryName) {
@@ -92,14 +125,11 @@ async function getBoxNumber(boxId) {
   }
 }
 
-async function syncProductToWoo(product) {
-  const client = wcClient();
-  if (!client) {
-    console.warn("[WooSync] WC credentials missing – skip");
-    return null;
-  }
-
-  const publicBase = (process.env.PUBLIC_API_URL || process.env.WEBSITE_URL || "").replace(/\/$/, "");
+async function buildPayload(client, product) {
+  const publicBase = (process.env.PUBLIC_API_URL || process.env.WEBSITE_URL || "").replace(
+    /\/$/,
+    ""
+  );
   const boxNumber = await getBoxNumber(product.box_id);
 
   const rawImages = Array.isArray(product.images)
@@ -165,73 +195,135 @@ async function syncProductToWoo(product) {
 
   if (images.length) payload.images = images;
   if (categoryId) payload.categories = [{ id: categoryId }];
-  // Always send tags array (empty clears only if we want — here send when we have any)
-  if (tags.length) {
-    payload.tags = tags;
-  }
+  if (tags.length) payload.tags = tags;
 
-  console.log("[WooSync] payload tags:", payload.tags, "short_description length:", shortDesc.length);
+  console.log(
+    "[WooSync] payload tags:",
+    payload.tags,
+    "short_description length:",
+    shortDesc.length
+  );
 
-  const allowCreate = product._allowCreate !== false;
-
-  try {
-    let result = null;
-    let existingId = product.woo_product_id ? Number(product.woo_product_id) : null;
-
-    if (existingId) {
-      try {
-        const { data } = await client.put(`/products/${existingId}`, payload);
-        result = data;
-        console.log(`[WooSync] 🔄 Updated by woo_id=${existingId} sku=${product.sku}`);
-      } catch (e) {
-        if (e.response?.status === 404) {
-          existingId = null;
-        } else {
-          throw e;
-        }
-      }
-    }
-
-    if (!result && product.sku) {
-      const { data: found } = await client.get("/products", {
-        params: { sku: product.sku, per_page: 5 },
-      });
-      const match = Array.isArray(found)
-        ? found.find((p) => String(p.sku || "").trim() === String(product.sku).trim())
-        : null;
-      if (match) {
-        const { data } = await client.put(`/products/${match.id}`, payload);
-        result = data;
-        console.log(`[WooSync] 🔄 Updated by SKU id=${match.id} sku=${product.sku}`);
-      }
-    }
-
-    if (!result) {
-      if (!allowCreate) {
-        console.warn(`[WooSync] No website product for sku=${product.sku} — skip create`);
-        return null;
-      }
-      const { data } = await client.post("/products", payload);
-      result = data;
-      console.log(`[WooSync] ✅ Created website product id=${data.id} sku=${product.sku}`);
-    }
-
-    if (result?.id && product.id) {
-      try {
-        await pool.query(`UPDATE products SET woo_product_id = $1 WHERE id = $2`, [
-          result.id,
-          product.id,
-        ]);
-      } catch (e) {
-        console.warn("[WooSync] could not save woo_product_id:", e.message);
-      }
-    }
-    return result;
-  } catch (err) {
-    const detail = err.response?.data || err.message;
-    console.error("[WooSync] ❌ Failed for sku=", product.sku, detail);
-    throw new Error(typeof detail === "object" ? JSON.stringify(detail) : String(detail));
-  }
+  return payload;
 }
 
-module.exports = { syncProductToWoo, wcClient };
+/**
+ * Sync one product to one Woo client.
+ */
+async function syncToClient(client, product, label, opts = {}) {
+  const { saveWooId = false, allowCreate = true, existingId = null } = opts;
+  const payload = await buildPayload(client, product);
+
+  let result = null;
+  let id = existingId ? Number(existingId) : null;
+
+  if (id) {
+    try {
+      const { data } = await client.put(`/products/${id}`, payload);
+      result = data;
+      console.log(`[WooSync:${label}] 🔄 Updated by id=${id} sku=${product.sku}`);
+    } catch (e) {
+      if (e.response?.status === 404) {
+        id = null;
+      } else {
+        throw e;
+      }
+    }
+  }
+
+  if (!result && product.sku) {
+    const { data: found } = await client.get("/products", {
+      params: { sku: product.sku, per_page: 5 },
+    });
+    const match = Array.isArray(found)
+      ? found.find((p) => String(p.sku || "").trim() === String(product.sku).trim())
+      : null;
+    if (match) {
+      const { data } = await client.put(`/products/${match.id}`, payload);
+      result = data;
+      console.log(`[WooSync:${label}] 🔄 Updated by SKU id=${match.id} sku=${product.sku}`);
+    }
+  }
+
+  if (!result) {
+    if (!allowCreate) {
+      console.warn(`[WooSync:${label}] No product for sku=${product.sku} — skip create`);
+      return null;
+    }
+    const { data } = await client.post("/products", payload);
+    result = data;
+    console.log(`[WooSync:${label}] ✅ Created id=${data.id} sku=${product.sku}`);
+  }
+
+  if (saveWooId && result?.id && product.id) {
+    try {
+      await pool.query(`UPDATE products SET woo_product_id = $1 WHERE id = $2`, [
+        result.id,
+        product.id,
+      ]);
+    } catch (e) {
+      console.warn(`[WooSync:${label}] could not save woo_product_id:`, e.message);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Main: Electrox always; VoltBank when category is energy-related.
+ */
+async function syncProductToWoo(product) {
+  const allowCreate = product._allowCreate !== false;
+  let primaryResult = null;
+
+  // 1) Electrox (primary) — same as before
+  const primary = wcClient();
+  if (primary) {
+    try {
+      primaryResult = await syncToClient(primary, product, "Electrox", {
+        saveWooId: true,
+        allowCreate,
+        existingId: product.woo_product_id || null,
+      });
+    } catch (err) {
+      const detail = err.response?.data || err.message;
+      console.error("[WooSync:Electrox] ❌ Failed for sku=", product.sku, detail);
+      // continue to VoltBank even if Electrox fails
+    }
+  } else {
+    console.warn("[WooSync] Electrox WC credentials missing – skip primary");
+  }
+
+  // 2) VoltBank (secondary) — only Solar / Batteries / Chargers / Power Supply / Cables
+  const vb = vbClient();
+  if (vb && isVoltBankCategory(product.category)) {
+    try {
+      await syncToClient(vb, product, "VoltBank", {
+        saveWooId: false,
+        allowCreate: true,
+        existingId: null,
+      });
+    } catch (err) {
+      const detail = err.response?.data || err.message;
+      console.error("[WooSync:VoltBank] ❌ Failed for sku=", product.sku, detail);
+    }
+  } else if (vb && product.category) {
+    console.log(
+      `[WooSync:VoltBank] skip sku=${product.sku} category="${product.category}" (not energy)`
+    );
+  }
+
+  if (!primary && !vb) {
+    console.warn("[WooSync] WC credentials missing – skip");
+    return null;
+  }
+
+  // If Electrox failed hard and we had no result, surface error like old code when only primary exists
+  if (primary && !primaryResult && !vb) {
+    throw new Error("Electrox sync failed");
+  }
+
+  return primaryResult;
+}
+
+module.exports = { syncProductToWoo, wcClient, vbClient, isVoltBankCategory };
