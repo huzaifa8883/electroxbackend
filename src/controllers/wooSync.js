@@ -49,8 +49,19 @@ function vbClient() {
   );
 }
 
+function normalizeCategoryName(categoryName) {
+  if (!categoryName) return categoryName;
+  let s = String(categoryName).trim();
+  // Inventory "Power Supplies" → website "Power Supply"
+  s = s.replace(/^Power Supplies$/i, 'Power Supply');
+  s = s.replace(/^Power Supplies\s*>/i, 'Power Supply >');
+  // Normalize "Cables > Others" child slug-friendly names stay as names for WC
+  return s;
+}
+
 async function findCategoryId(client, categoryName) {
   if (!categoryName) return null;
+  categoryName = normalizeCategoryName(categoryName);
   const parts = String(categoryName)
     .split(">")
     .map((s) => s.trim())
