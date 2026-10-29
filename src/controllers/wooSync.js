@@ -1,6 +1,7 @@
 
 /**
  * Push inventory product → WooCommerce (Electrox + optional VoltBank).
+ * On image upload errors: retry product create/update WITHOUT images.
  */
 const axios = require("axios");
 const pool = require("../config/db");
@@ -15,6 +16,8 @@ const VOLTBANK_CAT_KEYWORDS = [
   "cable",
 ];
 
+const ALLOWED_IMAGE_EXT = /\.(jpe?g|png|gif|webp)(\?.*)?$/i;
+
 function isVoltBankCategory(category) {
   if (!category) return false;
   const n = String(category).toLowerCase();
@@ -27,11 +30,10 @@ function makeWcClient(base, key, secret) {
   return axios.create({
     baseURL: `${base}/wp-json/wc/v3`,
     auth: { username: key, password: secret },
-    timeout: 30000,
+    timeout: 45000,
   });
 }
 
-/** Primary store (Electrox) */
 function wcClient() {
   return makeWcClient(
     process.env.WC_STORE_URL,
@@ -40,7 +42,6 @@ function wcClient() {
   );
 }
 
-/** Secondary store (VoltBank) */
 function vbClient() {
   return makeWcClient(
     process.env.VB_STORE_URL || process.env.VOLTBANK_STORE_URL,
@@ -52,10 +53,8 @@ function vbClient() {
 function normalizeCategoryName(categoryName) {
   if (!categoryName) return categoryName;
   let s = String(categoryName).trim();
-  // Inventory "Power Supplies" → website "Power Supply"
-  s = s.replace(/^Power Supplies$/i, 'Power Supply');
-  s = s.replace(/^Power Supplies\s*>/i, 'Power Supply >');
-  // Normalize "Cables > Others" child slug-friendly names stay as names for WC
+  s = s.replace(/^Power Supplies$/i, "Power Supply");
+  s = s.replace(/^Power Supplies\s*>/i, "Power Supply >");
   return s;
 }
 
@@ -122,7 +121,6 @@ async function resolveTags(client, tagsStr) {
       console.error("[WooSync] tag resolve failed:", name, err.response?.data || err.message);
     }
   }
-  console.log("[WooSync] resolved tags:", names, "→", out);
   return out;
 }
 
@@ -136,7 +134,19 @@ async function getBoxNumber(boxId) {
   }
 }
 
-async function buildPayload(client, product) {
+function isAllowedImageUrl(url) {
+  if (!url || typeof url !== "string") return false;
+  const u = url.trim();
+  if (!/^https?:\/\//i.test(u)) return false;
+  // strip query for ext check, but allow CDN urls with query
+  const path = u.split("?")[0];
+  if (ALLOWED_IMAGE_EXT.test(path)) return true;
+  // some stores serve /uploads/... without clear ext in rare cases — still try common image hosts
+  if (/\/uploads\/.*\.(jpe?g|png|gif|webp)/i.test(u)) return true;
+  return false;
+}
+
+async function buildPayload(client, product, { includeImages = true } = {}) {
   const publicBase = (process.env.PUBLIC_API_URL || process.env.WEBSITE_URL || "").replace(
     /\/$/,
     ""
@@ -160,9 +170,15 @@ async function buildPayload(client, product) {
   }
 
   const images = [];
-  for (const src of all.slice(0, 7)) {
-    const url = toAbsoluteImageUrl(src);
-    if (url) images.push({ src: url });
+  if (includeImages) {
+    for (const src of all.slice(0, 7)) {
+      const url = toAbsoluteImageUrl(src);
+      if (url && isAllowedImageUrl(url)) {
+        images.push({ src: url });
+      } else if (url) {
+        console.warn(`[WooSync] skip invalid image type: ${url}`);
+      }
+    }
   }
 
   const categoryId = await findCategoryId(client, product.category);
@@ -208,23 +224,22 @@ async function buildPayload(client, product) {
   if (categoryId) payload.categories = [{ id: categoryId }];
   if (tags.length) payload.tags = tags;
 
-  console.log(
-    "[WooSync] payload tags:",
-    payload.tags,
-    "short_description length:",
-    shortDesc.length
-  );
-
   return payload;
 }
 
-/**
- * Sync one product to one Woo client.
- */
-async function syncToClient(client, product, label, opts = {}) {
-  const { saveWooId = false, allowCreate = true, existingId = null } = opts;
-  const payload = await buildPayload(client, product);
+function isImageUploadError(err) {
+  const data = err.response?.data;
+  const code = data?.code || data?.data?.code || "";
+  const msg = String(data?.message || err.message || "").toLowerCase();
+  return (
+    code === "woocommerce_product_image_upload_error" ||
+    msg.includes("invalid image") ||
+    msg.includes("not allowed to upload") ||
+    msg.includes("file type")
+  );
+}
 
+async function putOrCreate(client, product, payload, label, existingId) {
   let result = null;
   let id = existingId ? Number(existingId) : null;
 
@@ -257,37 +272,85 @@ async function syncToClient(client, product, label, opts = {}) {
   }
 
   if (!result) {
-    if (!allowCreate) {
-      console.warn(`[WooSync:${label}] No product for sku=${product.sku} — skip create`);
-      return null;
-    }
     const { data } = await client.post("/products", payload);
     result = data;
     console.log(`[WooSync:${label}] ✅ Created id=${data.id} sku=${product.sku}`);
-  }
-
-  if (saveWooId && result?.id && product.id) {
-    try {
-      await pool.query(`UPDATE products SET woo_product_id = $1 WHERE id = $2`, [
-        result.id,
-        product.id,
-      ]);
-    } catch (e) {
-      console.warn(`[WooSync:${label}] could not save woo_product_id:`, e.message);
-    }
   }
 
   return result;
 }
 
 /**
- * Main: Electrox always; VoltBank when category is energy-related.
+ * Sync one product to one Woo client.
+ * If images fail → retry once without images so product still lands.
  */
+async function syncToClient(client, product, label, opts = {}) {
+  const { saveWooId = false, allowCreate = true, existingId = null } = opts;
+
+  let payload = await buildPayload(client, product, { includeImages: true });
+  if (!allowCreate && !existingId && !product.sku) {
+    return null;
+  }
+
+  try {
+    // If create not allowed and no existing, only update path
+    if (!allowCreate) {
+      // putOrCreate will still create — gate here
+      let probeId = existingId ? Number(existingId) : null;
+      if (!probeId && product.sku) {
+        const { data: found } = await client.get("/products", {
+          params: { sku: product.sku, per_page: 5 },
+        });
+        const match = Array.isArray(found)
+          ? found.find((p) => String(p.sku || "").trim() === String(product.sku).trim())
+          : null;
+        if (match) probeId = match.id;
+      }
+      if (!probeId) {
+        console.warn(`[WooSync:${label}] No product for sku=${product.sku} — skip create`);
+        return null;
+      }
+    }
+
+    let result;
+    try {
+      result = await putOrCreate(client, product, payload, label, existingId);
+    } catch (err) {
+      if (isImageUploadError(err) && payload.images && payload.images.length) {
+        console.warn(
+          `[WooSync:${label}] image failed for ${product.sku} — retry WITHOUT images`
+        );
+        payload = await buildPayload(client, product, { includeImages: false });
+        result = await putOrCreate(client, product, payload, label, existingId);
+        console.log(`[WooSync:${label}] ✅ Saved without images sku=${product.sku}`);
+      } else {
+        throw err;
+      }
+    }
+
+    if (saveWooId && result?.id && product.id) {
+      try {
+        await pool.query(`UPDATE products SET woo_product_id = $1 WHERE id = $2`, [
+          result.id,
+          product.id,
+        ]);
+      } catch (e) {
+        console.warn(`[WooSync:${label}] could not save woo_product_id:`, e.message);
+      }
+    }
+
+    return result;
+  } catch (err) {
+    const detail = err.response?.data || err.message;
+    console.error(`[WooSync:${label}] ❌ Failed for sku=`, product.sku, detail);
+    throw new Error(typeof detail === "object" ? JSON.stringify(detail) : String(detail));
+  }
+}
+
 async function syncProductToWoo(product) {
   const allowCreate = product._allowCreate !== false;
   let primaryResult = null;
 
-  // 1) Electrox (primary) — same as before
   const primary = wcClient();
   if (primary) {
     try {
@@ -297,15 +360,12 @@ async function syncProductToWoo(product) {
         existingId: product.woo_product_id || null,
       });
     } catch (err) {
-      const detail = err.response?.data || err.message;
-      console.error("[WooSync:Electrox] ❌ Failed for sku=", product.sku, detail);
-      // continue to VoltBank even if Electrox fails
+      console.error("[WooSync:Electrox] ❌", product.sku, err.message);
     }
   } else {
     console.warn("[WooSync] Electrox WC credentials missing – skip primary");
   }
 
-  // 2) VoltBank (secondary) — only Solar / Batteries / Chargers / Power Supply / Cables
   const vb = vbClient();
   if (vb && isVoltBankCategory(product.category)) {
     try {
@@ -315,8 +375,7 @@ async function syncProductToWoo(product) {
         existingId: null,
       });
     } catch (err) {
-      const detail = err.response?.data || err.message;
-      console.error("[WooSync:VoltBank] ❌ Failed for sku=", product.sku, detail);
+      console.error("[WooSync:VoltBank] ❌", product.sku, err.message);
     }
   } else if (vb && product.category) {
     console.log(
@@ -327,11 +386,6 @@ async function syncProductToWoo(product) {
   if (!primary && !vb) {
     console.warn("[WooSync] WC credentials missing – skip");
     return null;
-  }
-
-  // If Electrox failed hard and we had no result, surface error like old code when only primary exists
-  if (primary && !primaryResult && !vb) {
-    throw new Error("Electrox sync failed");
   }
 
   return primaryResult;
